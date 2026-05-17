@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.pyc
+__pycache__/
+settings.json
+profiles.json
+bin/ryzenadj
+*.log
+.DS_Store
+*.zip

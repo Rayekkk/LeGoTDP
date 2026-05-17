@@ -25,17 +25,9 @@ Designed for the **Lenovo Legion Go 2** - uses Lenovo WMI firmware attributes na
 
 ## Installation
 
-### Via DeckyLoader store (recommended)
-
-Search for **LeGoTDP** in the Decky Plugin Browser.
-
-### Manual
-
-1. Download the latest release `.zip` and extract it to `~/homebrew/plugins/LeGoTDP/`.
-2. Restart DeckyLoader:
-   ```bash
-   sudo systemctl restart plugin_loader
-   ```
+1. Download the latest `LeGoTDP.zip` from the [Releases](../../releases) page.
+2. In DeckyLoader, open the settings and enable **Developer Mode**.
+3. In the Developer section, choose **Install Plugin from ZIP** and select the downloaded file.
 
 ---
 
@@ -68,7 +60,7 @@ Values are set in watts (range reported by the device firmware, typically 1–54
 
 On devices with Lenovo WMI firmware attributes (`/sys/class/firmware-attributes/lenovo-wmi-other-0/`), the plugin writes directly to the sysfs interface - no external binary needed. On other AMD devices it falls back to calling `ryzenadj`.
 
-`ryzenadj` is fetched automatically from [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) GitHub releases on the first run. You can also build it from source with `setup.sh` or `make setup`.
+`ryzenadj` is fetched automatically from [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) GitHub releases on the first run.
 
 ---
 

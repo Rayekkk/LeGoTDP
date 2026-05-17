@@ -8,3 +8,4 @@ bin/ryzenadj
 *.log
 .DS_Store
 *.zip
+CHANGELOG.md

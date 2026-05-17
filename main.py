@@ -1,4 +1,5 @@
 import asyncio
+import glob
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
-import time
+import threading
 import urllib.request
 from typing import Optional
 
@@ -25,18 +26,17 @@ RYZENADJ_URL  = (
     "ryzenadj-manylinux_2_28-x86_64.tar.gz"
 )
 
-# ── Lenovo WMI sysfs paths ─────────────────────────────────────────────────────
-_WMI_BASE = "/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes"
-_WMI = {
-    "spl":  f"{_WMI_BASE}/ppt_pl1_spl",
-    "sppt": f"{_WMI_BASE}/ppt_pl2_sppt",
-    "fppt": f"{_WMI_BASE}/ppt_pl3_fppt",
-}
-_PLATFORM_PROFILE_DIR = "/sys/class/platform-profile"
-
 DEFAULT_SETTINGS = {"spl": 15000, "sppt": 15000, "fppt": 15000, "enabled": True}
 
+_ryzenadj_lock = threading.Lock()
+
+# Cache of last successful --info parse - keeps UI responsive when lock is held
+_info_cache: dict = {}
+_info_cache_lock = threading.Lock()
+
 _ROW_RE = re.compile(r"\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|")
+
+_current_game_id: str = ""
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ def _save_profiles(profiles: dict) -> None:
         json.dump(profiles, f)
 
 
-# ── ryzenadj download ──────────────────────────────────────────────────────────
+# ── ryzenadj binary ────────────────────────────────────────────────────────────
 
 def _download_ryzenadj() -> None:
     logger.info("Downloading ryzenadj from %s", RYZENADJ_URL)
@@ -88,15 +88,15 @@ def _download_ryzenadj() -> None:
              open(tmp_path, "wb") as out:
             out.write(resp.read())
         with tarfile.open(tmp_path, "r:gz") as tar:
-            binary_member = next(
+            member = next(
                 (m for m in tar.getmembers()
                  if os.path.basename(m.name) == "ryzenadj" and m.isfile()),
                 None,
             )
-            if binary_member is None:
+            if member is None:
                 raise RuntimeError("ryzenadj binary not found inside tarball")
-            binary_member.name = "ryzenadj"
-            tar.extract(binary_member, BIN_DIR)
+            member.name = "ryzenadj"
+            tar.extract(member, BIN_DIR)
         os.chmod(BIN_PATH, 0o755)
         logger.info("ryzenadj installed at %s", BIN_PATH)
     finally:
@@ -114,67 +114,23 @@ def _ensure_ryzenadj() -> None:
         os.chmod(BIN_PATH, mode | 0o111)
 
 
-# ── Lenovo WMI helpers ─────────────────────────────────────────────────────────
+# ── ryzenadj helpers ───────────────────────────────────────────────────────────
 
-def _wmi_available() -> bool:
-    return all(
-        os.path.exists(os.path.join(p, "current_value"))
-        for p in _WMI.values()
-    )
+def _run_ryzenadj(args: list, timeout: float = 5.0) -> tuple:
+    """Run ryzenadj, return (returncode, stdout, stderr).
+    Uses Popen so kill() after timeout never calls communicate() and blocks."""
+    if not os.path.isfile(BIN_PATH):
+        return -1, "", "ryzenadj not found"
+    proc = subprocess.Popen([BIN_PATH] + args,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out.decode(), err.decode()
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logger.warning("ryzenadj timed out: %s", args)
+        return -1, "", "timeout"
 
-
-def _find_lenovo_profile_path() -> Optional[str]:
-    if not os.path.isdir(_PLATFORM_PROFILE_DIR):
-        return None
-    for entry in os.listdir(_PLATFORM_PROFILE_DIR):
-        name_file = os.path.join(_PLATFORM_PROFILE_DIR, entry, "name")
-        if os.path.exists(name_file):
-            with open(name_file) as f:
-                if f.read().strip() == "lenovo-wmi-gamezone":
-                    return os.path.join(_PLATFORM_PROFILE_DIR, entry, "profile")
-    return None
-
-
-def _set_platform_profile_custom() -> None:
-    path = _find_lenovo_profile_path()
-    if path:
-        try:
-            with open(path, "w") as f:
-                f.write("custom")
-        except Exception as e:
-            logger.warning("Could not set platform profile: %s", e)
-
-
-def _wmi_read_int(attr: str, filename: str) -> Optional[int]:
-    p = os.path.join(_WMI[attr], filename)
-    if os.path.exists(p):
-        with open(p) as f:
-            return int(f.read().strip())
-    return None
-
-
-def _wmi_write(attr: str, value: int) -> None:
-    min_v = _wmi_read_int(attr, "min_value") or 0
-    max_v = _wmi_read_int(attr, "max_value") or 9999
-    clamped = max(min_v, min(max_v, value))
-    path = os.path.join(_WMI[attr], "current_value")
-    with open(path, "w") as f:
-        f.write(str(clamped))
-    logger.info("WMI %s = %d W (requested %d)", attr, clamped, value)
-
-
-def _apply_wmi(spl_w: int, sppt_w: int, fppt_w: int) -> dict:
-    _set_platform_profile_custom()
-    time.sleep(0.3)
-    _wmi_write("fppt", fppt_w)
-    time.sleep(0.3)
-    _wmi_write("sppt", sppt_w)
-    time.sleep(0.3)
-    _wmi_write("spl", spl_w)
-    return {"success": True, "stdout": "WMI TDP applied", "stderr": "", "returncode": 0}
-
-
-# ── ryzenadj output parser ─────────────────────────────────────────────────────
 
 def _parse_ryzenadj_output(text: str) -> dict:
     values: dict = {}
@@ -184,7 +140,6 @@ def _parse_ryzenadj_output(text: str) -> dict:
             continue
         name  = m.group(1).strip().upper()
         value = float(m.group(2))
-
         if "STAPM" in name and "LIMIT" in name:
             values["spl_limit"] = value
         elif "STAPM" in name and "VALUE" in name:
@@ -204,6 +159,133 @@ def _parse_ryzenadj_output(text: str) -> dict:
     return values
 
 
+def _apply_ryzenadj(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
+    if not _ryzenadj_lock.acquire(timeout=4.0):
+        return {"success": False, "stdout": "", "stderr": "ryzenadj busy", "returncode": -1}
+    try:
+        rc, out, err = _run_ryzenadj([
+            f"--stapm-limit={spl_mw}",
+            f"--slow-limit={sppt_mw}",
+            f"--fast-limit={fppt_mw}",
+        ])
+        logger.info("ryzenadj apply %dW/%dW/%dW -> rc=%d",
+                    spl_mw // 1000, sppt_mw // 1000, fppt_mw // 1000, rc)
+        return {"success": rc == 0, "stdout": out, "stderr": err, "returncode": rc}
+    finally:
+        _ryzenadj_lock.release()
+
+
+def _read_tdp_live() -> dict:
+    """Run ryzenadj --info and update cache. Non-blocking - returns cache if busy."""
+    if not _ryzenadj_lock.acquire(blocking=False):
+        with _info_cache_lock:
+            return dict(_info_cache)
+    try:
+        rc, out, err = _run_ryzenadj(["--info"], timeout=3.0)
+        if rc != 0:
+            with _info_cache_lock:
+                return dict(_info_cache)
+        parsed = _parse_ryzenadj_output(out + err)
+        with _info_cache_lock:
+            _info_cache.clear()
+            _info_cache.update(parsed)
+        return parsed
+    except Exception as e:
+        logger.warning("ryzenadj --info failed: %s", e)
+        with _info_cache_lock:
+            return dict(_info_cache)
+    finally:
+        _ryzenadj_lock.release()
+
+
+# ── Game detection ─────────────────────────────────────────────────────────────
+
+def _get_running_appid() -> str:
+    """Scan /proc/*/environ for a running Steam game. Returns appid or ''."""
+    for path in glob.glob("/proc/*/environ"):
+        try:
+            with open(path, "rb") as f:
+                for entry in f.read().split(b"\x00"):
+                    if entry.startswith(b"SteamAppId="):
+                        appid = entry[len(b"SteamAppId="):].decode()
+                        if appid and appid != "0":
+                            return appid
+        except OSError:
+            continue
+    return ""
+
+
+# ── TDP enforce ────────────────────────────────────────────────────────────────
+
+def _check_and_enforce() -> None:
+    global _current_game_id
+
+    s = _load_settings()
+    if not s.get("enabled", True):
+        return
+
+    appid = _get_running_appid()
+
+    if appid != _current_game_id:
+        prev = _current_game_id
+        _current_game_id = appid
+
+        if appid:
+            profiles = _load_profiles()
+            if appid in profiles:
+                p = profiles[appid]
+                result = _apply_ryzenadj(p["spl"], p["sppt"], p["fppt"])
+                if result["success"]:
+                    s["active_spl"]  = p["spl"]
+                    s["active_sppt"] = p["sppt"]
+                    s["active_fppt"] = p["fppt"]
+                    _save_settings(s)
+                    logger.info("Auto-applied game profile: app=%s", appid)
+                return
+        elif prev:
+            spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
+            sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
+            fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
+            result = _apply_ryzenadj(spl, sppt, fppt)
+            if result["success"]:
+                s["active_spl"]  = spl
+                s["active_sppt"] = sppt
+                s["active_fppt"] = fppt
+                _save_settings(s)
+                logger.info("Game exited, restored global TDP")
+            return
+
+    want_spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
+    want_sppt = s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"]))
+    want_fppt = s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"]))
+
+    if not _ryzenadj_lock.acquire(timeout=4.0):
+        return
+    try:
+        rc, out, err = _run_ryzenadj(["--info"], timeout=3.0)
+    finally:
+        _ryzenadj_lock.release()
+
+    if rc != 0:
+        return
+
+    parsed = _parse_ryzenadj_output(out + err)
+    with _info_cache_lock:
+        _info_cache.clear()
+        _info_cache.update(parsed)
+
+    cur_sppt = parsed.get("sppt_limit")
+    cur_fppt = parsed.get("fppt_limit")
+    want_sppt_w = want_sppt / 1000
+    want_fppt_w = want_fppt / 1000
+
+    if (cur_sppt is None or abs(cur_sppt - want_sppt_w) > 1.0 or
+            cur_fppt is None or abs(cur_fppt - want_fppt_w) > 1.0):
+        logger.info("TDP drift sppt=%s->%.0fW fppt=%s->%.0fW, re-applying",
+                    cur_sppt, want_sppt_w, cur_fppt, want_fppt_w)
+        _apply_ryzenadj(want_spl, want_sppt, want_fppt)
+
+
 # ── Plugin class ───────────────────────────────────────────────────────────────
 
 class Plugin:
@@ -211,7 +293,7 @@ class Plugin:
     _setup_error: Optional[str] = None
 
     async def is_ready(self) -> dict:
-        return {"ready": self._ready, "error": self._setup_error, "wmi": _wmi_available()}
+        return {"ready": self._ready, "error": self._setup_error}
 
     async def get_settings(self) -> dict:
         return _load_settings()
@@ -234,121 +316,77 @@ class Plugin:
         logger.info("Plugin enabled=%s", enabled)
 
     async def restore_defaults(self) -> dict:
-        """Write factory default_value to each WMI TDP attribute."""
-        if not _wmi_available():
-            return {"success": False, "stderr": "WMI not available", "stdout": "", "returncode": -1}
-        try:
-            _set_platform_profile_custom()
-            time.sleep(0.3)
-            for key in ("fppt", "sppt", "spl"):
-                default = _wmi_read_int(key, "default_value")
-                if default is not None:
-                    _wmi_write(key, default)
-                    time.sleep(0.3)
-            logger.info("WMI defaults restored")
-            return {"success": True, "stderr": "", "stdout": "Defaults restored", "returncode": 0}
-        except Exception as e:
-            logger.error("restore_defaults failed: %s", e)
-            return {"success": False, "stderr": str(e), "stdout": "", "returncode": -1}
+        def _do() -> dict:
+            if not _ryzenadj_lock.acquire(timeout=4.0):
+                return {"success": False, "stdout": "", "stderr": "ryzenadj busy", "returncode": -1}
+            try:
+                rc, out, err = _run_ryzenadj(["--max-performance"], timeout=5.0)
+                logger.info("restore_defaults rc=%d", rc)
+                return {"success": rc == 0, "stdout": out, "stderr": err, "returncode": rc}
+            finally:
+                _ryzenadj_lock.release()
 
-    async def get_limits(self) -> dict:
-        """Return per-parameter min/max in watts for the current device."""
-        if _wmi_available():
-            result = {}
-            for key in ("spl", "sppt", "fppt"):
-                result[key] = {
-                    "min": _wmi_read_int(key, "min_value") or 1,
-                    "max": _wmi_read_int(key, "max_value") or 54,
-                }
-            return result
-        return {k: {"min": 1, "max": 54} for k in ("spl", "sppt", "fppt")}
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
 
     async def get_tdp_info(self) -> dict:
         if not self._ready:
             return {"success": False, "values": {}, "error": "not ready"}
-
-        values: dict = {}
-
-        # Limits: prefer WMI (accurate); fall back to ryzenadj --info
-        if _wmi_available():
-            for key in ("spl", "sppt", "fppt"):
-                v = _wmi_read_int(key, "current_value")
-                if v is not None:
-                    values[f"{key}_limit"] = float(v)
-
-        # Current usage: always from ryzenadj --info (WMI has no live draw data)
-        if os.path.isfile(BIN_PATH):
-            try:
-                result = subprocess.run(
-                    [BIN_PATH, "--info"], capture_output=True, text=True, timeout=5
-                )
-                parsed = _parse_ryzenadj_output(result.stdout + result.stderr)
-                # Merge only VALUE fields; don't overwrite WMI limits
-                for k, v in parsed.items():
-                    if k.endswith("_value"):
-                        values[k] = v
-                    elif not _wmi_available() and k.endswith("_limit"):
-                        values[k] = v
-            except Exception as e:
-                logger.warning("ryzenadj --info failed: %s", e)
-
+        loop = asyncio.get_running_loop()
+        values = await loop.run_in_executor(None, _read_tdp_live)
         return {"success": True, "values": values}
 
     async def apply_tdp(self, spl: int, sppt: int, fppt: int, app_id: str = "") -> dict:
-        """Apply TDP limits. spl/sppt/fppt are in milliwatts. app_id saves a game profile."""
         if not self._ready:
             return {"success": False, "stderr": "not ready", "stdout": "", "returncode": -1}
 
-        spl_w  = spl  // 1000
-        sppt_w = sppt // 1000
-        fppt_w = fppt // 1000
-
-        if _wmi_available():
-            result = _apply_wmi(spl_w, sppt_w, fppt_w)
-        else:
-            cmd = [
-                BIN_PATH,
-                f"--stapm-limit={spl}",
-                f"--slow-limit={sppt}",
-                f"--fast-limit={fppt}",
-            ]
-            logger.info("Running: %s", " ".join(cmd))
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                result = {
-                    "success": r.returncode == 0,
-                    "stdout":  r.stdout,
-                    "stderr":  r.stderr,
-                    "returncode": r.returncode,
-                }
-            except subprocess.TimeoutExpired:
-                result = {"success": False, "stderr": "timeout", "stdout": "", "returncode": -1}
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _apply_ryzenadj, spl, sppt, fppt)
 
         if result["success"]:
+            s = _load_settings()
+            s["active_spl"]  = spl
+            s["active_sppt"] = sppt
+            s["active_fppt"] = fppt
             if app_id:
                 profiles = _load_profiles()
                 profiles[app_id] = {"spl": spl, "sppt": sppt, "fppt": fppt}
                 _save_profiles(profiles)
                 logger.info("Saved game profile: app=%s", app_id)
             else:
-                s = _load_settings()
-                s["spl"] = spl
+                s["spl"]  = spl
                 s["sppt"] = sppt
                 s["fppt"] = fppt
-                _save_settings(s)
+            _save_settings(s)
 
         return result
 
+    async def _enforce_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(5)
+            try:
+                await loop.run_in_executor(None, _check_and_enforce)
+            except Exception as e:
+                logger.warning("enforce iteration failed: %s", e)
+
     async def _main(self):
-        logger.info("RyzenADJ Set TDP: initialising (WMI=%s)", _wmi_available())
+        logger.info("LeGoTDP: initialising")
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, _ensure_ryzenadj)
             self._ready = True
-            logger.info("RyzenADJ Set TDP: ready")
+            asyncio.ensure_future(self._enforce_loop())
+            logger.info("LeGoTDP: ready")
+            s = _load_settings()
+            if s.get("enabled", True):
+                spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
+                sppt = s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"]))
+                fppt = s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"]))
+                await loop.run_in_executor(None, _apply_ryzenadj, spl, sppt, fppt)
         except Exception as e:
             self._setup_error = str(e)
-            logger.error("RyzenADJ Set TDP: setup failed: %s", e)
+            logger.error("LeGoTDP: setup failed: %s", e)
 
     async def _unload(self):
-        logger.info("RyzenADJ Set TDP: unloaded")
+        logger.info("LeGoTDP: unloaded")

@@ -31,7 +31,7 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 
 ## Requirements
 
-- Lenovo Legion Go 2 (or another AMD APU device running SteamOS)
+- Lenovo Legion Go 2
 - [DeckyLoader](https://github.com/SteamDeckHomebrew/decky-loader) installed
 
 ---
@@ -78,6 +78,12 @@ The Python backend runs an enforce loop every 5 seconds that:
 4. Re-applies settings if the system has overridden them (drift correction)
 
 `ryzenadj` is fetched automatically from [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) GitHub releases on the first run.
+
+---
+
+## Third-party
+
+This plugin downloads and uses [ryzenadj](https://github.com/FlyGoat/RyzenAdj) as an external binary, which is licensed under [LGPL-3.0](https://github.com/FlyGoat/RyzenAdj/blob/master/LICENSE).
 
 ---
 

@@ -65,8 +65,6 @@ The built frontend lands in `dist/`. Copy the entire plugin directory to `~/home
 | SPPT | `--slow-limit` | Slow Package Power Tracking - sustained hard ceiling | 5-37 W |
 | FPPT | `--fast-limit` | Fast Package Power Tracking - burst ceiling | 5-45 W |
 
-> Note: On Strix Point (Ryzen Z2 Extreme) STAPM always mirrors FPPT due to a known ryzenadj v0.19.0 limitation. SPPT and FPPT are the effective controls.
-
 ---
 
 ## How it works

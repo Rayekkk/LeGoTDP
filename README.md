@@ -22,6 +22,7 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 
 | Preset | SPL | SPPT | FPPT |
 |---|---|---|---|
+| Minimum | 5 W | 5 W | 10 W |
 | Silent | 8 W | 10 W | 15 W |
 | Balanced | 15 W | 18 W | 25 W |
 | Performance | 25 W | 28 W | 35 W |

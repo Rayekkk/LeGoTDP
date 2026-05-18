@@ -37,6 +37,7 @@ _info_cache_lock = threading.Lock()
 _ROW_RE = re.compile(r"\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|")
 
 _current_game_id: str = ""
+_panel_active: bool = False
 
 
 # ── Settings ───────────────────────────────────────────────────────────────────
@@ -175,25 +176,21 @@ def _apply_ryzenadj(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
         _ryzenadj_lock.release()
 
 
-def _read_tdp_live() -> dict:
-    """Run ryzenadj --info and update cache. Non-blocking - returns cache if busy."""
+# ── Info cache refresh ─────────────────────────────────────────────────────────
+
+def _refresh_info_cache() -> None:
     if not _ryzenadj_lock.acquire(blocking=False):
-        with _info_cache_lock:
-            return dict(_info_cache)
+        return
     try:
         rc, out, err = _run_ryzenadj(["--info"], timeout=3.0)
         if rc != 0:
-            with _info_cache_lock:
-                return dict(_info_cache)
+            return
         parsed = _parse_ryzenadj_output(out + err)
         with _info_cache_lock:
             _info_cache.clear()
             _info_cache.update(parsed)
-        return parsed
-    except Exception as e:
-        logger.warning("ryzenadj --info failed: %s", e)
-        with _info_cache_lock:
-            return dict(_info_cache)
+    except Exception:
+        pass
     finally:
         _ryzenadj_lock.release()
 
@@ -329,12 +326,15 @@ class Plugin:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
 
+    async def set_panel_active(self, active: bool) -> None:
+        global _panel_active
+        _panel_active = active
+
     async def get_tdp_info(self) -> dict:
         if not self._ready:
             return {"success": False, "values": {}, "error": "not ready"}
-        loop = asyncio.get_running_loop()
-        values = await loop.run_in_executor(None, _read_tdp_live)
-        return {"success": True, "values": values}
+        with _info_cache_lock:
+            return {"success": True, "values": dict(_info_cache)}
 
     async def apply_tdp(self, spl: int, sppt: int, fppt: int, app_id: str = "") -> dict:
         if not self._ready:
@@ -361,6 +361,13 @@ class Plugin:
 
         return result
 
+    async def _info_loop(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(2)
+            if _panel_active:
+                await loop.run_in_executor(None, _refresh_info_cache)
+
     async def _enforce_loop(self):
         loop = asyncio.get_running_loop()
         while True:
@@ -377,6 +384,7 @@ class Plugin:
             await loop.run_in_executor(None, _ensure_ryzenadj)
             self._ready = True
             asyncio.ensure_future(self._enforce_loop())
+            asyncio.ensure_future(self._info_loop())
             logger.info("LeGoTDP: ready")
             s = _load_settings()
             if s.get("enabled", True):

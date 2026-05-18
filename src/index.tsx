@@ -18,9 +18,10 @@ const toW   = (mw: number) => Math.round(mw / 1000);
 const fmt   = (v?: number) => v != null ? `${v.toFixed(1)} W` : "-";
 
 // ── Presets ────────────────────────────────────────────────────────────────────
-type PresetKey = "silent" | "balanced" | "performance" | "max" | "custom";
+type PresetKey = "minimum" | "silent" | "balanced" | "performance" | "max" | "custom";
 
 const PRESETS: Record<Exclude<PresetKey, "custom">, { spl: number; sppt: number; fppt: number }> = {
+  minimum:     { spl: 5,  sppt: 5,  fppt: 10 },
   silent:      { spl: 8,  sppt: 10, fppt: 15 },
   balanced:    { spl: 15, sppt: 18, fppt: 25 },
   performance: { spl: 25, sppt: 28, fppt: 35 },
@@ -28,6 +29,7 @@ const PRESETS: Record<Exclude<PresetKey, "custom">, { spl: number; sppt: number;
 };
 
 const PRESET_LABELS: Record<PresetKey, string> = {
+  minimum:     "Minimum",
   silent:      "Silent",
   balanced:    "Balanced",
   performance: "Performance",
@@ -35,7 +37,7 @@ const PRESET_LABELS: Record<PresetKey, string> = {
   custom:      "Custom",
 };
 
-const PRESET_ORDER: PresetKey[] = ["silent", "balanced", "performance", "max", "custom"];
+const PRESET_ORDER: PresetKey[] = ["minimum", "silent", "balanced", "performance", "max", "custom"];
 
 function detectPreset(spl: number, sppt: number, fppt: number): PresetKey {
   for (const key of Object.keys(PRESETS) as Exclude<PresetKey, "custom">[]) {
@@ -67,6 +69,7 @@ const getGameProfile    = callable<[string], GameProfile>("get_game_profile");
 const deleteGameProfile = callable<[string], void>("delete_game_profile");
 const setPluginEnabled  = callable<[boolean], void>("set_plugin_enabled");
 const restoreDefaults   = callable<[], TdpResult>("restore_defaults");
+const setPanelActive    = callable<[boolean], void>("set_panel_active");
 
 // ── Slider limits ──────────────────────────────────────────────────────────────
 const LIMITS = {
@@ -98,12 +101,17 @@ const LivePanel: FC = () => {
 
   useEffect(() => {
     let active = true;
+    setPanelActive(true);
     const refresh = async () => {
       try { if (active) setInfo(await getTdpInfo()); } catch (_) {}
     };
     refresh();
     const id = setInterval(refresh, 2000);
-    return () => { active = false; clearInterval(id); };
+    return () => {
+      active = false;
+      clearInterval(id);
+      setPanelActive(false);
+    };
   }, []);
 
   const v = info?.values ?? {};

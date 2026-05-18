@@ -94,4 +94,4 @@ This plugin downloads and uses [ryzenadj](https://github.com/FlyGoat/RyzenAdj) a
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

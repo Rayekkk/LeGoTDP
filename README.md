@@ -32,20 +32,22 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 
 ## Requirements
 
-- Lenovo Legion Go 2
-- [DeckyLoader](https://github.com/SteamDeckHomebrew/decky-loader) installed
+| Requirement | Details |
+|---|---|
+| Device | Lenovo Legion Go 2 |
+| Plugin loader | [DeckyLoader](https://github.com/SteamDeckHomebrew/decky-loader) |
 
 ---
 
 ## Installation
 
+### Easy install (recommended)
+
 1. Download the latest `LeGoTDP.zip` from the [Releases](../../releases) page.
 2. In DeckyLoader, open the settings and enable **Developer Mode**.
 3. In the Developer section, choose **Install Plugin from ZIP** and select the downloaded file.
 
----
-
-## Building from source
+### From source
 
 **Prerequisites:** Node.js >= 18, npm
 
@@ -79,6 +81,8 @@ The Python backend runs an enforce loop every 5 seconds that:
 4. Re-applies settings if the system has overridden them (drift correction)
 
 `ryzenadj` is fetched automatically from [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj) GitHub releases on the first run.
+
+---
 
 ---
 

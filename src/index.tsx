@@ -78,6 +78,20 @@ const setPanelActive    = callable<[boolean], void>("set_panel_active");
 const checkUpdate       = callable<[], UpdateInfo>("check_update");
 const performUpdate     = callable<[string, string], { success: boolean; path?: string; error?: string }>("perform_update");
 
+// ── Shared styles ──────────────────────────────────────────────────────────────
+const styles = {
+  valueTag: {
+    fontSize: "13px", fontWeight: "bold", color: "#fff",
+    background: "rgba(255,255,255,0.1)", borderRadius: "4px",
+    padding: "1px 6px", fontFamily: "monospace",
+  },
+  warningBox: {
+    background: "rgba(251,191,36,0.15)", border: "1px solid rgba(251,191,36,0.4)",
+    borderRadius: "6px", padding: "8px 10px", fontSize: "11px",
+    color: "rgba(251,191,36,0.9)", lineHeight: "1.5", marginTop: "4px",
+  },
+};
+
 // ── Slider limits ──────────────────────────────────────────────────────────────
 const LIMITS = {
   spl:  { min: 5, max: 35 },
@@ -152,10 +166,10 @@ const LivePanel: FC = () => {
 
 // ── Update section ─────────────────────────────────────────────────────────────
 const UpdateSection: FC = () => {
-  const [checking,  setChecking]   = useState(false);
+  const [checking,    setChecking]    = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [zipPath,   setZipPath]    = useState<string | null>(null);
-  const [info,      setInfo]       = useState<UpdateInfo | null>(null);
+  const [zipPath,     setZipPath]     = useState<string | null>(null);
+  const [info,        setInfo]        = useState<UpdateInfo | null>(null);
 
   const handleCheck = async () => {
     setChecking(true);
@@ -188,61 +202,49 @@ const UpdateSection: FC = () => {
     setDownloading(false);
   };
 
-  const filename = zipPath ? zipPath.split("/").pop() : "";
-
   return (
     <PanelSection title="Updates">
+      <PanelSectionRow>
+        <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.6)" }}>
+          Installed: <span style={styles.valueTag}>v{info?.current_version ?? "1.2.0"}</span>
+          {info?.success && info.latest_version && (
+            <span> &nbsp; Latest: <span style={styles.valueTag}>v{info.latest_version}</span></span>
+          )}
+        </div>
+      </PanelSectionRow>
+      {info && !info.success && (
+        <PanelSectionRow>
+          <div style={{ ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" }}>
+            {info.error ?? "Unknown error"}
+          </div>
+        </PanelSectionRow>
+      )}
+      {info?.success && !info.has_update && !zipPath && (
+        <PanelSectionRow>
+          <div style={{ fontSize: "12px", color: "#4ade80" }}>Up to date</div>
+        </PanelSectionRow>
+      )}
+      {info?.success && info.has_update && !zipPath && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={handleDownload} disabled={downloading}>
+            {downloading ? "Downloading..." : `Download v${info.latest_version}`}
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+      {zipPath && (
+        <PanelSectionRow>
+          <div style={styles.warningBox}>
+            Downloaded to <span style={{ fontFamily: "monospace", wordBreak: "break-all" }}>{zipPath}</span>
+            <br /><br />
+            To install: Decky → Developer → Uninstall LeGoTDP → Install Plugin from ZIP → select the file.
+          </div>
+        </PanelSectionRow>
+      )}
       <PanelSectionRow>
         <ButtonItem layout="below" onClick={handleCheck} disabled={checking || downloading}>
           {checking ? "Checking..." : "Check for updates"}
         </ButtonItem>
       </PanelSectionRow>
-      {info && !info.success && (
-        <PanelSectionRow>
-          <Field label="Error" description={info.error ?? "Unknown error"} />
-        </PanelSectionRow>
-      )}
-      {info?.success && !info.has_update && !zipPath && (
-        <PanelSectionRow>
-          <Field label="Up to date" description={`v${info.current_version}`} />
-        </PanelSectionRow>
-      )}
-      {info?.success && info.has_update && !downloading && !zipPath && (
-        <>
-          <PanelSectionRow>
-            <Field label="Update available"
-              description={`v${info.current_version} -> v${info.latest_version}`} />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <ButtonItem layout="below" onClick={handleDownload}>
-              {`Download v${info.latest_version}`}
-            </ButtonItem>
-          </PanelSectionRow>
-        </>
-      )}
-      {downloading && (
-        <PanelSectionRow>
-          <Field label="Downloading..." description="Please wait" />
-        </PanelSectionRow>
-      )}
-      {zipPath && (
-        <>
-          <PanelSectionRow>
-            <Field label="Downloaded!" description={`~/Downloads/${filename}`} />
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <Field label="To install:"
-              description={
-                "1. Open DeckyLoader settings\n" +
-                "2. Go to Developer\n" +
-                "3. Uninstall LeGoTDP\n" +
-                "4. Install Plugin from ZIP\n" +
-                `5. Select ${filename}`
-              }
-            />
-          </PanelSectionRow>
-        </>
-      )}
     </PanelSection>
   );
 };

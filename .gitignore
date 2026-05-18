@@ -1,11 +1,25 @@
+# Node
 node_modules/
-dist/
-*.pyc
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+
+# Build output
+dist/
+*.zip
+
+# Plugin runtime
 settings.json
 profiles.json
 bin/ryzenadj
 *.log
+
+# OS
 .DS_Store
-*.zip
+Thumbs.db
+
+# Claude Code
+CLAUDE.md
 CHANGELOG.md

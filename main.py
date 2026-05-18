@@ -1,7 +1,7 @@
+import decky
 import asyncio
 import glob
 import json
-import logging
 import os
 import re
 import ssl
@@ -13,9 +13,6 @@ import pwd
 import threading
 import urllib.request
 from typing import Optional
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("LeGoTDP")
 
 PLUGIN_DIR    = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR       = os.path.join(PLUGIN_DIR, "bin")
@@ -79,7 +76,7 @@ def _save_profiles(profiles: dict) -> None:
 # ── ryzenadj binary ────────────────────────────────────────────────────────────
 
 def _download_ryzenadj() -> None:
-    logger.info("Downloading ryzenadj from %s", RYZENADJ_URL)
+    decky.logger.info(f"[legotdp] Downloading ryzenadj from {RYZENADJ_URL}")
     os.makedirs(BIN_DIR, exist_ok=True)
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz")
     os.close(tmp_fd)
@@ -101,7 +98,7 @@ def _download_ryzenadj() -> None:
             member.name = "ryzenadj"
             tar.extract(member, BIN_DIR)
         os.chmod(BIN_PATH, 0o755)
-        logger.info("ryzenadj installed at %s", BIN_PATH)
+        decky.logger.info(f"[legotdp] ryzenadj installed at {BIN_PATH}")
     finally:
         try:
             os.unlink(tmp_path)
@@ -131,7 +128,7 @@ def _run_ryzenadj(args: list, timeout: float = 5.0) -> tuple:
         return proc.returncode, out.decode(), err.decode()
     except subprocess.TimeoutExpired:
         proc.kill()
-        logger.warning("ryzenadj timed out: %s", args)
+        decky.logger.warning(f"[legotdp] ryzenadj timed out: {args}")
         return -1, "", "timeout"
 
 
@@ -171,8 +168,7 @@ def _apply_ryzenadj(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
             f"--slow-limit={sppt_mw}",
             f"--fast-limit={fppt_mw}",
         ])
-        logger.info("ryzenadj apply %dW/%dW/%dW -> rc=%d",
-                    spl_mw // 1000, sppt_mw // 1000, fppt_mw // 1000, rc)
+        decky.logger.info(f"[legotdp] ryzenadj apply {spl_mw//1000}W/{sppt_mw//1000}W/{fppt_mw//1000}W -> rc={rc}")
         return {"success": rc == 0, "stdout": out, "stderr": err, "returncode": rc}
     finally:
         _ryzenadj_lock.release()
@@ -239,7 +235,7 @@ def _check_and_enforce() -> None:
                     s["active_sppt"] = p["sppt"]
                     s["active_fppt"] = p["fppt"]
                     _save_settings(s)
-                    logger.info("Auto-applied game profile: app=%s", appid)
+                    decky.logger.info(f"[legotdp] Auto-applied game profile: app={appid}")
                 return
         elif prev:
             spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
@@ -251,7 +247,7 @@ def _check_and_enforce() -> None:
                 s["active_sppt"] = sppt
                 s["active_fppt"] = fppt
                 _save_settings(s)
-                logger.info("Game exited, restored global TDP")
+                decky.logger.info("[legotdp] Game exited, restored global TDP")
             return
 
     want_spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
@@ -280,8 +276,7 @@ def _check_and_enforce() -> None:
 
     if (cur_sppt is None or abs(cur_sppt - want_sppt_w) > 1.0 or
             cur_fppt is None or abs(cur_fppt - want_fppt_w) > 1.0):
-        logger.info("TDP drift sppt=%s->%.0fW fppt=%s->%.0fW, re-applying",
-                    cur_sppt, want_sppt_w, cur_fppt, want_fppt_w)
+        decky.logger.info(f"[legotdp] TDP drift sppt={cur_sppt}->{want_sppt_w:.0f}W fppt={cur_fppt}->{want_fppt_w:.0f}W, re-applying")
         _apply_ryzenadj(want_spl, want_sppt, want_fppt)
 
 
@@ -306,13 +301,13 @@ class Plugin:
         profiles = _load_profiles()
         profiles.pop(app_id, None)
         _save_profiles(profiles)
-        logger.info("Deleted game profile: app=%s", app_id)
+        decky.logger.info(f"[legotdp] Deleted game profile: app={app_id}")
 
     async def set_plugin_enabled(self, enabled: bool) -> None:
         s = _load_settings()
         s["enabled"] = enabled
         _save_settings(s)
-        logger.info("Plugin enabled=%s", enabled)
+        decky.logger.info(f"[legotdp] Plugin enabled={enabled}")
 
     async def restore_defaults(self) -> dict:
         def _do() -> dict:
@@ -320,7 +315,7 @@ class Plugin:
                 return {"success": False, "stdout": "", "stderr": "ryzenadj busy", "returncode": -1}
             try:
                 rc, out, err = _run_ryzenadj(["--max-performance"], timeout=5.0)
-                logger.info("restore_defaults rc=%d", rc)
+                decky.logger.info(f"[legotdp] restore_defaults rc={rc}")
                 return {"success": rc == 0, "stdout": out, "stderr": err, "returncode": rc}
             finally:
                 _ryzenadj_lock.release()
@@ -354,7 +349,7 @@ class Plugin:
                 profiles = _load_profiles()
                 profiles[app_id] = {"spl": spl, "sppt": sppt, "fppt": fppt}
                 _save_profiles(profiles)
-                logger.info("Saved game profile: app=%s", app_id)
+                decky.logger.info(f"[legotdp] Saved game profile: app={app_id}")
             else:
                 s["spl"]  = spl
                 s["sppt"] = sppt
@@ -380,25 +375,21 @@ class Plugin:
                     current_ver = json.load(f).get("version", "0.0.0")
                 def _v(s):
                     return tuple(int(x) for x in s.split("."))
-                has_update = _v(latest_ver) > _v(current_ver)
-                download_url = next(
-                    (a["browser_download_url"] for a in data.get("assets", [])
-                     if a["name"].endswith(".zip")),
-                    "",
-                )
+                asset = next((a for a in data.get("assets", []) if a["name"].endswith(".zip")), None)
                 return {
-                    "success": True, "has_update": has_update,
-                    "current_version": current_ver, "latest_version": latest_ver,
-                    "download_url": download_url,
+                    "current_version":  current_ver,
+                    "latest_version":   latest_ver,
+                    "update_available": _v(latest_ver) > _v(current_ver),
+                    "download_url":     asset["browser_download_url"] if asset else None,
+                    "asset_name":       asset["name"] if asset else None,
                 }
             except Exception as e:
-                logger.error("check_update failed: %s", e)
-                return {"success": False, "error": str(e), "has_update": False,
-                        "current_version": "", "latest_version": "", "download_url": ""}
+                decky.logger.error(f"[legotdp] check_update: {e}")
+                return {"error": str(e)}
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
 
-    async def perform_update(self, download_url: str, latest_version: str) -> dict:
+    async def perform_update(self, download_url: str, asset_name: str) -> dict:
         def _do() -> dict:
             try:
                 user = next(
@@ -408,7 +399,7 @@ class Plugin:
                 )
                 downloads_dir = os.path.join(user.pw_dir, "Downloads") if user else "/home/deck/Downloads"
                 os.makedirs(downloads_dir, exist_ok=True)
-                dest = os.path.join(downloads_dir, f"LeGoTDP-{latest_version}.zip")
+                dest = os.path.join(downloads_dir, asset_name)
                 if os.path.exists(dest):
                     os.unlink(dest)
                 ssl_ctx = ssl.create_default_context()
@@ -417,10 +408,10 @@ class Plugin:
                 with urllib.request.urlopen(download_url, context=ssl_ctx, timeout=60) as resp, \
                      open(dest, "wb") as f:
                     f.write(resp.read())
-                logger.info("perform_update: downloaded to %s", dest)
+                decky.logger.info(f"[legotdp] update downloaded to {dest}")
                 return {"success": True, "path": dest}
             except Exception as e:
-                logger.error("perform_update failed: %s", e)
+                decky.logger.error(f"[legotdp] perform_update: {e}")
                 return {"success": False, "error": str(e)}
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
@@ -439,17 +430,17 @@ class Plugin:
             try:
                 await loop.run_in_executor(None, _check_and_enforce)
             except Exception as e:
-                logger.warning("enforce iteration failed: %s", e)
+                decky.logger.warning(f"[legotdp] enforce iteration failed: {e}")
 
     async def _main(self):
-        logger.info("LeGoTDP: initialising")
+        decky.logger.info("[legotdp] initialising")
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, _ensure_ryzenadj)
             self._ready = True
             asyncio.ensure_future(self._enforce_loop())
             asyncio.ensure_future(self._info_loop())
-            logger.info("LeGoTDP: ready")
+            decky.logger.info("[legotdp] ready")
             s = _load_settings()
             if s.get("enabled", True):
                 spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
@@ -458,7 +449,7 @@ class Plugin:
                 await loop.run_in_executor(None, _apply_ryzenadj, spl, sppt, fppt)
         except Exception as e:
             self._setup_error = str(e)
-            logger.error("LeGoTDP: setup failed: %s", e)
+            decky.logger.error(f"[legotdp] setup failed: {e}")
 
     async def _unload(self):
-        logger.info("LeGoTDP: unloaded")
+        decky.logger.info("[legotdp] unloaded")

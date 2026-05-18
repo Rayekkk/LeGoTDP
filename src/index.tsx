@@ -59,10 +59,13 @@ interface TdpInfo     { success: boolean; values: TdpValues; error?: string }
 interface GameProfile { exists: boolean; profile: Settings }
 interface RunningGame { appId: string; name: string }
 interface ReadyState  { ready: boolean; error: string | null }
-interface UpdateInfo  {
-  success: boolean; has_update: boolean;
-  current_version: string; latest_version: string;
-  download_url: string; error?: string;
+interface UpdateInfo {
+  current_version?: string;
+  latest_version?: string;
+  update_available?: boolean;
+  download_url?: string;
+  asset_name?: string;
+  error?: string;
 }
 
 // ── Backend callables ──────────────────────────────────────────────────────────
@@ -176,28 +179,22 @@ const UpdateSection: FC = () => {
     setInfo(null);
     setZipPath(null);
     try { setInfo(await checkUpdate()); }
-    catch (e: unknown) {
-      setInfo({ success: false, error: String(e), has_update: false,
-                current_version: "", latest_version: "", download_url: "" });
-    }
+    catch (e: unknown) { setInfo({ error: String(e) }); }
     setChecking(false);
   };
 
   const handleDownload = async () => {
-    if (!info?.download_url) {
-      setInfo({ ...info!, success: false, error: "No zip asset found in release" });
-      return;
-    }
+    if (!info?.download_url || !info?.asset_name) return;
     setDownloading(true);
     try {
-      const r = await performUpdate(info.download_url, info.latest_version);
+      const r = await performUpdate(info.download_url, info.asset_name);
       if (r.success && r.path) {
         setZipPath(r.path);
       } else {
-        setInfo({ ...info!, success: false, error: r.error ?? "Download failed" });
+        setInfo({ error: r.error ?? "Download failed" });
       }
     } catch (e: unknown) {
-      setInfo({ ...info!, success: false, error: String(e) });
+      setInfo({ error: String(e) });
     }
     setDownloading(false);
   };
@@ -207,24 +204,24 @@ const UpdateSection: FC = () => {
       <PanelSectionRow>
         <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.6)" }}>
           Installed: <span style={styles.valueTag}>v{info?.current_version ?? "1.2.0"}</span>
-          {info?.success && info.latest_version && (
+          {!info?.error && info?.latest_version && (
             <span> &nbsp; Latest: <span style={styles.valueTag}>v{info.latest_version}</span></span>
           )}
         </div>
       </PanelSectionRow>
-      {info && !info.success && (
+      {info?.error && (
         <PanelSectionRow>
           <div style={{ ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" }}>
-            {info.error ?? "Unknown error"}
+            {info.error}
           </div>
         </PanelSectionRow>
       )}
-      {info?.success && !info.has_update && !zipPath && (
+      {info && !info.error && !info.update_available && !zipPath && (
         <PanelSectionRow>
           <div style={{ fontSize: "12px", color: "#4ade80" }}>Up to date</div>
         </PanelSectionRow>
       )}
-      {info?.success && info.has_update && !zipPath && (
+      {info?.update_available && !zipPath && (
         <PanelSectionRow>
           <ButtonItem layout="below" onClick={handleDownload} disabled={downloading}>
             {downloading ? "Downloading..." : `Download v${info.latest_version}`}
@@ -463,7 +460,9 @@ const Content: FC = () => {
         </PanelSectionRow>
         {status && !enabled && (
           <PanelSectionRow>
-            <Field label="Status" description={status} />
+            <div style={status.startsWith("Error:") ? { ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" } : { fontSize: "12px", color: "#4ade80" }}>
+              {status}
+            </div>
           </PanelSectionRow>
         )}
       </PanelSection>
@@ -497,7 +496,9 @@ const Content: FC = () => {
           ))}
           {status && (
             <PanelSectionRow>
-              <Field label="Status" description={status} />
+              <div style={status.startsWith("Error:") ? { ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" } : { fontSize: "12px", color: "#4ade80" }}>
+                {status}
+              </div>
             </PanelSectionRow>
           )}
         </PanelSection>
@@ -541,7 +542,9 @@ const Content: FC = () => {
               </PanelSectionRow>
               {status && (
                 <PanelSectionRow>
-                  <Field label="Status" description={status} />
+                  <div style={status.startsWith("Error:") ? { ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" } : { fontSize: "12px", color: "#4ade80" }}>
+                    {status}
+                  </div>
                 </PanelSectionRow>
               )}
             </PanelSection>

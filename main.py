@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import pwd
 import threading
 import urllib.request
 from typing import Optional
@@ -25,6 +26,7 @@ RYZENADJ_URL  = (
     "https://github.com/FlyGoat/RyzenAdj/releases/download/v0.19.0/"
     "ryzenadj-manylinux_2_28-x86_64.tar.gz"
 )
+GITHUB_API_URL = "https://api.github.com/repos/Rayekkk/LeGoTDP/releases/latest"
 
 DEFAULT_SETTINGS = {"spl": 15000, "sppt": 15000, "fppt": 15000, "enabled": True}
 
@@ -360,6 +362,68 @@ class Plugin:
             _save_settings(s)
 
         return result
+
+    async def check_update(self) -> dict:
+        def _do() -> dict:
+            try:
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                req = urllib.request.Request(
+                    GITHUB_API_URL,
+                    headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "LeGoTDP"},
+                )
+                with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                latest_ver = data["tag_name"].lstrip("v")
+                with open(os.path.join(PLUGIN_DIR, "plugin.json")) as f:
+                    current_ver = json.load(f).get("version", "0.0.0")
+                def _v(s):
+                    return tuple(int(x) for x in s.split("."))
+                has_update = _v(latest_ver) > _v(current_ver)
+                download_url = next(
+                    (a["browser_download_url"] for a in data.get("assets", [])
+                     if a["name"].endswith(".zip")),
+                    "",
+                )
+                return {
+                    "success": True, "has_update": has_update,
+                    "current_version": current_ver, "latest_version": latest_ver,
+                    "download_url": download_url,
+                }
+            except Exception as e:
+                logger.error("check_update failed: %s", e)
+                return {"success": False, "error": str(e), "has_update": False,
+                        "current_version": "", "latest_version": "", "download_url": ""}
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
+
+    async def perform_update(self, download_url: str, latest_version: str) -> dict:
+        def _do() -> dict:
+            try:
+                user = next(
+                    (p for p in sorted(pwd.getpwall(), key=lambda p: p.pw_uid)
+                     if p.pw_uid >= 1000 and os.path.isdir(p.pw_dir)),
+                    None,
+                )
+                downloads_dir = os.path.join(user.pw_dir, "Downloads") if user else "/home/deck/Downloads"
+                os.makedirs(downloads_dir, exist_ok=True)
+                dest = os.path.join(downloads_dir, f"LeGoTDP-{latest_version}.zip")
+                if os.path.exists(dest):
+                    os.unlink(dest)
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(download_url, context=ssl_ctx, timeout=60) as resp, \
+                     open(dest, "wb") as f:
+                    f.write(resp.read())
+                logger.info("perform_update: downloaded to %s", dest)
+                return {"success": True, "path": dest}
+            except Exception as e:
+                logger.error("perform_update failed: %s", e)
+                return {"success": False, "error": str(e)}
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
 
     async def _info_loop(self):
         loop = asyncio.get_running_loop()

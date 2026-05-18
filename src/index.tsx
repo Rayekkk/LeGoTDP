@@ -59,6 +59,11 @@ interface TdpInfo     { success: boolean; values: TdpValues; error?: string }
 interface GameProfile { exists: boolean; profile: Settings }
 interface RunningGame { appId: string; name: string }
 interface ReadyState  { ready: boolean; error: string | null }
+interface UpdateInfo  {
+  success: boolean; has_update: boolean;
+  current_version: string; latest_version: string;
+  download_url: string; error?: string;
+}
 
 // ── Backend callables ──────────────────────────────────────────────────────────
 const isReady           = callable<[], ReadyState>("is_ready");
@@ -70,6 +75,8 @@ const deleteGameProfile = callable<[string], void>("delete_game_profile");
 const setPluginEnabled  = callable<[boolean], void>("set_plugin_enabled");
 const restoreDefaults   = callable<[], TdpResult>("restore_defaults");
 const setPanelActive    = callable<[boolean], void>("set_panel_active");
+const checkUpdate       = callable<[], UpdateInfo>("check_update");
+const performUpdate     = callable<[string, string], { success: boolean; path?: string; error?: string }>("perform_update");
 
 // ── Slider limits ──────────────────────────────────────────────────────────────
 const LIMITS = {
@@ -136,6 +143,103 @@ const LivePanel: FC = () => {
           <PanelSectionRow>
             <Field label="FPPT (Fast)"
               description={`Limit: ${fmt(v.fppt_limit)}   -   Now: ${fmt(v.fppt_value)}`} />
+          </PanelSectionRow>
+        </>
+      )}
+    </PanelSection>
+  );
+};
+
+// ── Update section ─────────────────────────────────────────────────────────────
+const UpdateSection: FC = () => {
+  const [checking,  setChecking]   = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [zipPath,   setZipPath]    = useState<string | null>(null);
+  const [info,      setInfo]       = useState<UpdateInfo | null>(null);
+
+  const handleCheck = async () => {
+    setChecking(true);
+    setInfo(null);
+    setZipPath(null);
+    try { setInfo(await checkUpdate()); }
+    catch (e: unknown) {
+      setInfo({ success: false, error: String(e), has_update: false,
+                current_version: "", latest_version: "", download_url: "" });
+    }
+    setChecking(false);
+  };
+
+  const handleDownload = async () => {
+    if (!info?.download_url) {
+      setInfo({ ...info!, success: false, error: "No zip asset found in release" });
+      return;
+    }
+    setDownloading(true);
+    try {
+      const r = await performUpdate(info.download_url, info.latest_version);
+      if (r.success && r.path) {
+        setZipPath(r.path);
+      } else {
+        setInfo({ ...info!, success: false, error: r.error ?? "Download failed" });
+      }
+    } catch (e: unknown) {
+      setInfo({ ...info!, success: false, error: String(e) });
+    }
+    setDownloading(false);
+  };
+
+  const filename = zipPath ? zipPath.split("/").pop() : "";
+
+  return (
+    <PanelSection title="Updates">
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={handleCheck} disabled={checking || downloading}>
+          {checking ? "Checking..." : "Check for updates"}
+        </ButtonItem>
+      </PanelSectionRow>
+      {info && !info.success && (
+        <PanelSectionRow>
+          <Field label="Error" description={info.error ?? "Unknown error"} />
+        </PanelSectionRow>
+      )}
+      {info?.success && !info.has_update && !zipPath && (
+        <PanelSectionRow>
+          <Field label="Up to date" description={`v${info.current_version}`} />
+        </PanelSectionRow>
+      )}
+      {info?.success && info.has_update && !downloading && !zipPath && (
+        <>
+          <PanelSectionRow>
+            <Field label="Update available"
+              description={`v${info.current_version} -> v${info.latest_version}`} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem layout="below" onClick={handleDownload}>
+              {`Download v${info.latest_version}`}
+            </ButtonItem>
+          </PanelSectionRow>
+        </>
+      )}
+      {downloading && (
+        <PanelSectionRow>
+          <Field label="Downloading..." description="Please wait" />
+        </PanelSectionRow>
+      )}
+      {zipPath && (
+        <>
+          <PanelSectionRow>
+            <Field label="Downloaded!" description={`~/Downloads/${filename}`} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <Field label="To install:"
+              description={
+                "1. Open DeckyLoader settings\n" +
+                "2. Go to Developer\n" +
+                "3. Uninstall LeGoTDP\n" +
+                "4. Install Plugin from ZIP\n" +
+                `5. Select ${filename}`
+              }
+            />
           </PanelSectionRow>
         </>
       )}
@@ -442,6 +546,8 @@ const Content: FC = () => {
           </>
         )}
       </>}
+
+      <UpdateSection />
     </>
   );
 };

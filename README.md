@@ -8,12 +8,14 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 
 ## Features
 
-- **Presets** - Silent / Balanced / Performance / Max with one tap
+- **Presets** - Minimum / Silent / Balanced / Performance / Max with one tap
 - **Custom mode** - fine-tune SPL, SPPT and FPPT via sliders
 - **Per-game profiles** - automatically applied in the background when a game launches, no need to open the plugin menu
+- **Separate AC profile** - set independent TDP limits for battery and charging; switches automatically when AC state changes
 - **Live TDP panel** - shows current limits and real-time power draw from ryzenadj
 - **Drift enforcement** - re-applies your settings every 5 seconds if the system overrides them
 - **Enable/disable toggle** - restores firmware defaults (`--max-performance`) when turned off
+- **Extended TDP range** - Extras section unlocks Custom sliders up to 60 W (advanced users, use at your own risk)
 - Auto-downloads a pre-built `ryzenadj` binary on first run (no manual setup needed)
 
 ---

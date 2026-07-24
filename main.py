@@ -63,18 +63,47 @@ _current_game_id: str = ""
 _current_ac_online: bool = False
 _panel_active: bool = False
 
+# The frontend detects the running game via Steam's Router, which is authoritative;
+# the /proc/*/environ scan misses games sandboxed by pressure-vessel/gamescope. When
+# the panel is open the frontend pushes the appid here; we trust it while it is fresh
+# and fall back to the proc scan once it goes stale (panel closed).
+_frontend_appid: str = ""
+_frontend_appid_ts: float = 0.0
+_FRONTEND_APPID_TTL = 12.0
+
 
 # ── AC power detection ─────────────────────────────────────────────────────────
 
+def _read_sysfs(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _get_ac_online() -> bool:
-    for path in glob.glob("/sys/class/power_supply/*/online"):
-        try:
-            with open(path) as f:
-                if f.read().strip() == "1":
-                    return True
-        except OSError:
+    """True when an external charger is present.
+
+    Only Mains-type supplies count. The Legion Go 2 also exposes USB-C PD source
+    PSYs (ucsi-source-psy-*, type=USB, scope=Device) whose `online` flag tracks the
+    port's PD role, not whether the device is being powered - ORing those in made an
+    unplug flicker straight back to "charging". ACAD (Mains) is the real signal, and
+    BAT0 status is unreliable here because battery conservation mode reports
+    "Not charging" even while on AC.
+    """
+    mains_seen = False
+    for path in glob.glob("/sys/class/power_supply/*"):
+        if _read_sysfs(os.path.join(path, "type")) != "Mains":
             continue
-    return False
+        mains_seen = True
+        if _read_sysfs(os.path.join(path, "online")) == "1":
+            return True
+    if mains_seen:
+        return False
+    # No Mains supply exposed at all - fall back to battery status.
+    status = _read_sysfs("/sys/class/power_supply/BAT0/status")
+    return status not in ("", "Discharging", "Unknown")
 
 
 def _pick_profile_values(p: dict, ac_online: bool) -> tuple:
@@ -511,7 +540,30 @@ def _refresh_info_cache() -> None:
 # ── Game detection ─────────────────────────────────────────────────────────────
 
 def _get_running_appid() -> str:
-    """Scan /proc/*/environ for a running Steam game. Returns appid or ''."""
+    """Current Steam game appid, or ''.
+
+    Prefer the frontend's Router-based value while it is fresh - the /proc scan below
+    misses games running inside pressure-vessel/gamescope. Falls back to the scan when
+    the frontend has gone quiet (panel closed)."""
+    if time.monotonic() - _frontend_appid_ts < _FRONTEND_APPID_TTL:
+        return _frontend_appid
+    return _scan_proc_for_appid()
+
+
+def _scan_proc_for_appid() -> str:
+    # The Steam "reaper" wrapper (reaper SteamLaunch AppId=NNNN -- ...) runs outside
+    # the game's pressure-vessel/gamescope sandbox, so its cmdline is the most reliable
+    # background signal. Fall back to SteamAppId in the environ.
+    for path in glob.glob("/proc/*/cmdline"):
+        try:
+            with open(path, "rb") as f:
+                for arg in f.read().split(b"\x00"):
+                    if arg.startswith(b"AppId="):
+                        appid = arg[len(b"AppId="):].decode(errors="replace")
+                        if appid and appid != "0":
+                            return appid
+        except OSError:
+            continue
     for path in glob.glob("/proc/*/environ"):
         try:
             with open(path, "rb") as f:
@@ -809,6 +861,12 @@ class Plugin:
     async def set_panel_active(self, active: bool) -> None:
         global _panel_active
         _panel_active = active
+
+    async def set_running_game(self, app_id: str) -> None:
+        """Frontend reports the authoritative running-game appid (or '' for none)."""
+        global _frontend_appid, _frontend_appid_ts
+        _frontend_appid = app_id or ""
+        _frontend_appid_ts = time.monotonic()
 
     async def get_tdp_info(self) -> dict:
         if not self._ready:

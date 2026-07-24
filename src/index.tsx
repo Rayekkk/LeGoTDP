@@ -164,6 +164,7 @@ const deleteGameProfile = callable<[string], void>("delete_game_profile");
 const setPluginEnabled  = callable<[boolean], void>("set_plugin_enabled");
 const restoreDefaults   = callable<[], TdpResult>("restore_defaults");
 const setPanelActive    = callable<[boolean], void>("set_panel_active");
+const setRunningGame    = callable<[string], void>("set_running_game");
 const checkUpdate      = callable<[], UpdateInfo>("check_update");
 const performUpdate    = callable<[string, string], { success: boolean; path?: string; error?: string }>("perform_update");
 const getPowerSource       = callable<[], { ac: boolean }>("get_power_source");
@@ -446,7 +447,11 @@ const Content: FC = () => {
   useEffect(() => {
     if (!ready) return;
     const poll = async () => {
-      setGame(detectRunningGame());
+      const g = detectRunningGame();
+      setGame(g);
+      // Feed the backend the authoritative appid so its enforce loop applies the
+      // right per-game / AC profile even for games its /proc scan cannot see.
+      try { await setRunningGame(g?.appId ?? ""); } catch (_) {}
       try { const ps = await getPowerSource(); setAcOnline(ps.ac); } catch (_) {}
     };
     poll();

@@ -16,6 +16,64 @@ import { FC, useEffect, useRef, useState } from "react";
 const toMw  = (w: number)  => w * 1000;
 const toW   = (mw: number) => Math.round(mw / 1000);
 const fmt   = (v?: number) => v != null ? `${v.toFixed(1)} W` : "-";
+const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
+
+// ── Tuning model ───────────────────────────────────────────────────────────────
+// SPL is the actual TDP dial. SPPT and FPPT are expressed as headroom *above* SPL
+// rather than absolute watts, so raising the TDP carries the burst limits with it.
+interface Tuning { spl: number; spptOff: number; fpptOff: number }
+interface Caps   { spl: number; sppt: number; fppt: number }
+
+const OFFSET_MAX = { sppt: 10, fppt: 15 };
+
+// Used until get_caps() answers; the backend reports the firmware's real ceilings.
+const FALLBACK_STD: Caps = { spl: 35, sppt: 37, fppt: 45 };
+const FALLBACK_MAX: Caps = { spl: 50, sppt: 50, fppt: 50 };
+const FALLBACK_MIN = 5;
+
+/** Headroom still available above the current SPL, per parameter. */
+const offsetMax = (spl: number, caps: Caps) => ({
+  sppt: Math.max(0, Math.min(OFFSET_MAX.sppt, caps.sppt - spl)),
+  fppt: Math.max(0, Math.min(OFFSET_MAX.fppt, caps.fppt - spl)),
+});
+
+/** Force a tuning back inside the ceilings, keeping SPPT <= FPPT. */
+function normalise(t: Tuning, caps: Caps, minW: number): Tuning {
+  const spl = clamp(t.spl, minW, caps.spl);
+  const max = offsetMax(spl, caps);
+  const spptOff = clamp(t.spptOff, 0, max.sppt);
+  const fpptOff = Math.max(clamp(t.fpptOff, 0, max.fppt), spptOff);
+  return { spl, spptOff, fpptOff };
+}
+
+const absolute = (t: Tuning) => ({
+  spl: t.spl, sppt: t.spl + t.spptOff, fppt: t.spl + t.fpptOff,
+});
+
+const fromAbsolute = (spl: number, sppt: number, fppt: number): Tuning => ({
+  spl, spptOff: Math.max(0, sppt - spl), fpptOff: Math.max(0, fppt - spl),
+});
+
+const sameTuning = (a: Tuning, b: Tuning) =>
+  a.spl === b.spl && a.spptOff === b.spptOff && a.fpptOff === b.fpptOff;
+
+/** Slider handlers implementing the coupling rules between the three limits. */
+function makeTuningHandlers(t: Tuning, set: (next: Tuning) => void, caps: Caps, minW: number) {
+  return {
+    // Moving SPL re-clamps both offsets: at the ceiling there is no headroom left.
+    onSpl: (v: number) => set(normalise({ ...t, spl: v }, caps, minW)),
+    onSppt: (v: number) => {
+      const spptOff = clamp(v, 0, offsetMax(t.spl, caps).sppt);
+      // Pushing SPPT up drags FPPT along so SPPT never overtakes it.
+      set({ ...t, spptOff, fpptOff: Math.max(t.fpptOff, spptOff) });
+    },
+    onFppt: (v: number) => {
+      const fpptOff = clamp(v, 0, offsetMax(t.spl, caps).fppt);
+      // Pulling FPPT below SPPT drags SPPT down to meet it.
+      set({ ...t, fpptOff, spptOff: Math.min(t.spptOff, fpptOff) });
+    },
+  };
+}
 
 // ── Presets ────────────────────────────────────────────────────────────────────
 type PresetKey = "minimum" | "silent" | "balanced" | "performance" | "max" | "custom";
@@ -48,7 +106,7 @@ function detectPreset(spl: number, sppt: number, fppt: number): PresetKey {
 }
 
 function profileLabel(spl: number, sppt: number, fppt: number, stored?: string): string {
-  const customLabel = `Custom (${spl}/${sppt}/${fppt})`;
+  const customLabel = `Custom (${spl} +${sppt - spl}/+${fppt - spl})`;
   if (stored !== undefined) {
     if (stored === "custom" || stored === "") return customLabel;
     return PRESET_LABELS[stored as PresetKey] ?? stored;
@@ -57,42 +115,33 @@ function profileLabel(spl: number, sppt: number, fppt: number, stored?: string):
   return key === "custom" ? customLabel : PRESET_LABELS[key];
 }
 
-const exceedsStd = (spl: number, sppt: number, fppt: number) =>
-  spl > STD_LIMITS.spl.max || sppt > STD_LIMITS.sppt.max || fppt > STD_LIMITS.fppt.max;
+const exceedsCaps = (spl: number, sppt: number, fppt: number, caps: Caps) =>
+  spl > caps.spl || sppt > caps.sppt || fppt > caps.fppt;
 
 function statusStyle(msg: string) {
-  return msg.startsWith("Error:")
+  return msg.startsWith("Error")
     ? { ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" }
     : { fontSize: "12px", color: "#4ade80" };
-}
-
-function makeCascadeHandlers(
-  [a, setA]: [number, (v: number) => void],
-  [b, setB]: [number, (v: number) => void],
-  [c, setC]: [number, (v: number) => void],
-) {
-  return {
-    onA: (v: number) => { setA(v); if (b < v) { setB(v); if (c < v) setC(v); } },
-    onB: (v: number) => { setB(v); if (a > v) setA(v); if (c < v) setC(v); },
-    onC: (v: number) => { setC(v); if (b > v) { setB(v); if (a > v) setA(v); } },
-  };
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 interface Settings   { spl: number; sppt: number; fppt: number; enabled: boolean; active_preset?: string }
 interface TdpResult  { success: boolean; stderr: string }
 interface TdpValues  {
-  spl_limit?:  number; spl_value?:  number;
-  sppt_limit?: number; sppt_value?: number;
-  fppt_limit?: number; fppt_value?: number;
+  spl_limit?:  number;
+  sppt_limit?: number;
+  fppt_limit?: number;
+  package_draw?: number;
+  source?: string;
 }
 interface TdpInfo     { success: boolean; values: TdpValues; error?: string }
 interface GameProfile {
   exists: boolean;
-  profile: { spl: number; sppt: number; fppt: number; enabled: boolean; preset?: string };
+  profile: { spl: number; sppt: number; fppt: number; preset?: string };
   ac_separate: boolean;
-  ac_profile: { spl: number; sppt: number; fppt: number; enabled: boolean; ac_preset?: string };
+  ac_profile: { spl: number; sppt: number; fppt: number; ac_preset?: string };
 }
+interface CapsInfo   { min: number; std: Caps; max: Caps; wmi: boolean }
 interface RunningGame { appId: string; name: string }
 interface ReadyState  { ready: boolean; error: string | null }
 interface UpdateInfo {
@@ -107,6 +156,7 @@ interface UpdateInfo {
 // ── Backend callables ──────────────────────────────────────────────────────────
 const isReady           = callable<[], ReadyState>("is_ready");
 const getSettings       = callable<[], Settings>("get_settings");
+const getCaps           = callable<[], CapsInfo>("get_caps");
 const applyTdp          = callable<[number, number, number, string, string], TdpResult>("apply_tdp");
 const getTdpInfo        = callable<[], TdpInfo>("get_tdp_info");
 const getGameProfile    = callable<[string], GameProfile>("get_game_profile");
@@ -139,10 +189,6 @@ const styles = {
     color: "rgba(251,191,36,0.9)", lineHeight: "1.5", marginTop: "4px",
   },
 };
-
-// ── Slider limits ──────────────────────────────────────────────────────────────
-const STD_LIMITS = { spl: { min: 5, max: 35 }, sppt: { min: 5, max: 37 }, fppt: { min: 5, max: 45 } };
-const MAX_LIMITS = { spl: { min: 5, max: 60 }, sppt: { min: 5, max: 60 }, fppt: { min: 5, max: 60 } };
 
 // ── Steam game detection ───────────────────────────────────────────────────────
 const detectRunningGame = (): RunningGame | null => {
@@ -192,16 +238,19 @@ const LivePanel: FC = () => {
       ) : (
         <>
           <PanelSectionRow>
-            <Field label="SPL  (Sustained)"
-              description={`Limit: ${fmt(v.spl_limit)}   -   Now: ${fmt(v.spl_value)}`} />
+            <Field label="SPL  (Sustained)" description={`Limit: ${fmt(v.spl_limit)}`} />
           </PanelSectionRow>
           <PanelSectionRow>
-            <Field label="SPPT (Slow)"
-              description={`Limit: ${fmt(v.sppt_limit)}   -   Now: ${fmt(v.sppt_value)}`} />
+            <Field label="SPPT (Slow)" description={`Limit: ${fmt(v.sppt_limit)}`} />
           </PanelSectionRow>
           <PanelSectionRow>
-            <Field label="FPPT (Fast)"
-              description={`Limit: ${fmt(v.fppt_limit)}   -   Now: ${fmt(v.fppt_value)}`} />
+            <Field label="FPPT (Fast)" description={`Limit: ${fmt(v.fppt_limit)}`} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <Field
+              label="Package draw"
+              description={`${fmt(v.package_draw)}${v.source ? `   -   set via ${v.source}` : ""}`}
+            />
           </PanelSectionRow>
         </>
       )}
@@ -293,10 +342,13 @@ const Content: FC = () => {
   const [ready,    setReady]    = useState(false);
   const [setupErr, setSetupErr] = useState<string | null>(null);
 
-  const [spl,      setSpl]      = useState(15);
-  const [sppt,     setSppt]     = useState(15);
-  const [fppt,     setFppt]     = useState(15);
+  const [tuning,   setTuning]   = useState<Tuning>(fromAbsolute(15, 18, 25));
+  const [acTuning, setAcTuning] = useState<Tuning>(fromAbsolute(15, 18, 25));
   const [preset,   setPreset]   = useState<PresetKey>("balanced");
+
+  const [stdCaps, setStdCaps] = useState<Caps>(FALLBACK_STD);
+  const [maxCaps, setMaxCaps] = useState<Caps>(FALLBACK_MAX);
+  const [minW,    setMinW]    = useState(FALLBACK_MIN);
 
   const [enabled,       setEnabled]       = useState(true);
   const [game,          setGame]          = useState<RunningGame | null>(null);
@@ -305,11 +357,8 @@ const Content: FC = () => {
   const [acOnline,      setAcOnline]      = useState(false);
   const [acSeparate,    setAcSeparate]    = useState(false);
   const [editingAc,     setEditingAc]     = useState(false);
-  const [acSpl,         setAcSpl]         = useState(15);
-  const [acSppt,        setAcSppt]        = useState(18);
-  const [acFppt,        setAcFppt]        = useState(25);
 
-  const [globalProfile, setGlobalProfile] = useState<{ spl: number; sppt: number; fppt: number; preset: string | undefined }>({ spl: 15, sppt: 15, fppt: 15, preset: undefined });
+  const [globalProfile, setGlobalProfile] = useState<{ spl: number; sppt: number; fppt: number; preset: string | undefined }>({ spl: 15, sppt: 18, fppt: 25, preset: undefined });
   const [extrasUnlocked, setExtrasUnlocked] = useState(false);
 
   const [savedPreset,   setSavedPreset]   = useState<string | undefined>(undefined);
@@ -323,7 +372,11 @@ const Content: FC = () => {
 
   useEffect(() => () => { if (statusTimerRef.current) clearTimeout(statusTimerRef.current); }, []);
 
-  const limits = extrasUnlocked ? MAX_LIMITS : STD_LIMITS;
+  const caps    = extrasUnlocked ? maxCaps : stdCaps;
+  const active  = editingAc ? acTuning : tuning;
+  const setActive = editingAc ? setAcTuning : setTuning;
+  const handlers = makeTuningHandlers(active, setActive, caps, minW);
+  const om      = offsetMax(active.spl, caps);
 
   const showStatus = (msg: string | null) => {
     if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
@@ -336,20 +389,21 @@ const Content: FC = () => {
       if (gp.exists) showStatus("Error: Game profile data is missing or corrupt.");
       return;
     }
-    const w = toW(gp.profile.spl), sw = toW(gp.profile.sppt), fw = toW(gp.profile.fppt);
-    const acData = gp.ac_profile ?? { spl: gp.profile.spl, sppt: gp.profile.sppt, fppt: gp.profile.fppt, ac_preset: "" };
-    const aw = toW(acData.spl), asw = toW(acData.sppt), afw = toW(acData.fppt);
+    const p  = gp.profile;
+    const t  = fromAbsolute(toW(p.spl), toW(p.sppt), toW(p.fppt));
+    const ac = gp.ac_profile ?? { spl: p.spl, sppt: p.sppt, fppt: p.fppt, ac_preset: "" };
+    const at = fromAbsolute(toW(ac.spl), toW(ac.sppt), toW(ac.fppt));
     setPerGame(true);
-    setSpl(w); setSppt(sw); setFppt(fw);
-    setAcSpl(aw); setAcSppt(asw); setAcFppt(afw);
+    setTuning(t);
+    setAcTuning(at);
     setAcSeparate(gp.ac_separate);
     setEditingAc(false);
-    const storedPreset = (gp.profile.preset as PresetKey | undefined) || undefined;
+    const storedPreset = (p.preset as PresetKey | undefined) || undefined;
     setSavedPreset(storedPreset);
-    setSavedAcPreset(gp.ac_separate ? (acData.ac_preset ?? "") : undefined);
-    setPreset(storedPreset || detectPreset(w, sw, fw));
+    setSavedAcPreset(gp.ac_separate ? (ac.ac_preset ?? "") : undefined);
+    setPreset(storedPreset || detectPreset(toW(p.spl), toW(p.sppt), toW(p.fppt)));
     try {
-      await applyTdp(gp.profile.spl, gp.profile.sppt, gp.profile.fppt, appId, "");
+      await applyTdp(p.spl, p.sppt, p.fppt, appId, "");
     } catch (e: unknown) {
       showStatus(`Error applying TDP: ${String(e)}`);
       return;
@@ -366,10 +420,13 @@ const Content: FC = () => {
         if (!active) return;
         if (r.error) { setSetupErr(r.error); return; }
         if (r.ready) {
-          const [s, ps, eu] = await Promise.all([getSettings(), getPowerSource(), getExtrasUnlocked()]);
+          const [s, ps, eu, c] = await Promise.all([
+            getSettings(), getPowerSource(), getExtrasUnlocked(), getCaps(),
+          ]);
           if (!active) return;
+          if (c?.std && c?.max) { setStdCaps(c.std); setMaxCaps(c.max); setMinW(c.min); }
           const w = toW(s.spl), sw = toW(s.sppt), fw = toW(s.fppt);
-          setSpl(w); setSppt(sw); setFppt(fw);
+          setTuning(fromAbsolute(w, sw, fw));
           setGlobalProfile({ spl: w, sppt: sw, fppt: fw, preset: s.active_preset || undefined });
           setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw));
           setEnabled(s.enabled !== false);
@@ -419,7 +476,7 @@ const Content: FC = () => {
         try {
           const s = await getSettings();
           const w = toW(s.spl), sw = toW(s.sppt), fw = toW(s.fppt);
-          setSpl(w); setSppt(sw); setFppt(fw);
+          setTuning(fromAbsolute(w, sw, fw));
           setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw));
           setGlobalProfile({ spl: w, sppt: sw, fppt: fw, preset: s.active_preset || undefined });
           if (wasInGame) {
@@ -450,38 +507,36 @@ const Content: FC = () => {
   // ── Preset handler ────────────────────────────────────────────────────────────
   const handlePresetChange = async (key: PresetKey) => {
     const prevPreset = preset;
-    const prevSpl = spl, prevSppt = sppt, prevFppt = fppt;
-    const prevAcSpl = acSpl, prevAcSppt = acSppt, prevAcFppt = acFppt;
+    const prevTuning = tuning, prevAcTuning = acTuning;
     setPreset(key);
     if (key === "custom") return;
 
     const vals = PRESETS[key];
-    if (editingAc) {
-      setAcSpl(vals.spl); setAcSppt(vals.sppt); setAcFppt(vals.fppt);
-    } else {
-      setSpl(vals.spl); setSppt(vals.sppt); setFppt(vals.fppt);
-    }
+    const next = normalise(fromAbsolute(vals.spl, vals.sppt, vals.fppt), caps, minW);
+    if (editingAc) setAcTuning(next); else setTuning(next);
+
     setLoading(true);
     showStatus(null);
     const appId = (perGame && game) ? game.appId : "";
+    const a = absolute(next);
     try {
       if (editingAc && appId) {
-        const r = await setGameAcProfile(appId, toMw(vals.spl), toMw(vals.sppt), toMw(vals.fppt), acSeparate, key);
+        const r = await setGameAcProfile(appId, toMw(a.spl), toMw(a.sppt), toMw(a.fppt), acSeparate, key);
         if (r.success) {
           setSavedAcPreset(key);
         } else {
           setPreset(prevPreset);
-          setAcSpl(prevAcSpl); setAcSppt(prevAcSppt); setAcFppt(prevAcFppt);
+          setAcTuning(prevAcTuning);
         }
         showStatus(r.success ? `AC: ${PRESET_LABELS[key]} saved for ${game!.name}.` : `Error: ${r.stderr || "unknown"}`);
       } else {
-        const r = await applyTdp(toMw(vals.spl), toMw(vals.sppt), toMw(vals.fppt), appId, key);
+        const r = await applyTdp(toMw(a.spl), toMw(a.sppt), toMw(a.fppt), appId, key);
         if (r.success) {
-          if (!appId) { setGlobalProfile({ spl: vals.spl, sppt: vals.sppt, fppt: vals.fppt, preset: key }); }
+          if (!appId) setGlobalProfile({ ...a, preset: key });
           else setSavedPreset(key);
         } else {
           setPreset(prevPreset);
-          setSpl(prevSpl); setSppt(prevSppt); setFppt(prevFppt);
+          setTuning(prevTuning);
         }
         showStatus(r.success
           ? (appId ? `${PRESET_LABELS[key]} saved for ${game!.name}.` : `${PRESET_LABELS[key]} applied.`)
@@ -490,18 +545,11 @@ const Content: FC = () => {
       }
     } catch (e: unknown) {
       setPreset(prevPreset);
-      if (editingAc) { setAcSpl(prevAcSpl); setAcSppt(prevAcSppt); setAcFppt(prevAcFppt); }
-      else { setSpl(prevSpl); setSppt(prevSppt); setFppt(prevFppt); }
+      if (editingAc) setAcTuning(prevAcTuning); else setTuning(prevTuning);
       showStatus(`Error: ${String(e)}`);
     }
     setLoading(false);
   };
-
-  // ── Slider handlers (cascade clamp SPL <= SPPT <= FPPT) ──────────────────────
-  const { onA: handleSplChange, onB: handleSpptChange, onC: handleFpptChange } =
-    makeCascadeHandlers([spl, setSpl], [sppt, setSppt], [fppt, setFppt]);
-  const { onA: handleAcSplChange, onB: handleAcSpptChange, onC: handleAcFpptChange } =
-    makeCascadeHandlers([acSpl, setAcSpl], [acSppt, setAcSppt], [acFppt, setAcFppt]);
 
   // ── Per-game toggle ───────────────────────────────────────────────────────────
   const handlePerGameToggle = async (checked: boolean) => {
@@ -513,14 +561,13 @@ const Content: FC = () => {
       setEditingAc(false);
       setSavedPreset(undefined);
       setSavedAcPreset(undefined);
-      autoAppliedRef.current = null;
       let profileDeleted = false;
       try {
         await deleteGameProfile(game.appId);
         profileDeleted = true;
         const s = await getSettings();
         const w = toW(s.spl), sw = toW(s.sppt), fw = toW(s.fppt);
-        setSpl(w); setSppt(sw); setFppt(fw);
+        setTuning(fromAbsolute(w, sw, fw));
         setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw));
         setGlobalProfile({ spl: w, sppt: sw, fppt: fw, preset: s.active_preset || undefined });
         await applyTdp(s.spl, s.sppt, s.fppt, "", s.active_preset || "");
@@ -528,12 +575,13 @@ const Content: FC = () => {
       } catch (e: unknown) {
         if (!profileDeleted) {
           setPerGame(true);
-          autoAppliedRef.current = game.appId;
           setAcSeparate(prevAcSeparate); setEditingAc(prevEditingAc);
           setSavedPreset(prevSavedPreset); setSavedAcPreset(prevSavedAcPreset);
         }
         showStatus(`Error: ${String(e)}`);
       }
+      // Cleared last so the auto-apply effect cannot race the delete above.
+      autoAppliedRef.current = profileDeleted ? game.appId : null;
     } else if (checked && game) {
       try {
         const gp = await getGameProfile(game.appId);
@@ -560,7 +608,11 @@ const Content: FC = () => {
       await setPluginEnabled(checked);
       if (!checked) {
         const r = await restoreDefaults();
-        showStatus(r.success ? "Plugin disabled. Default TDP restored." : `Error: ${r.stderr || "unknown"}`);
+        showStatus(r.success ? "Plugin disabled. Firmware defaults restored." : `Error: ${r.stderr || "unknown"}`);
+      } else {
+        const a = absolute(tuning);
+        await applyTdp(toMw(a.spl), toMw(a.sppt), toMw(a.fppt), "", preset === "custom" ? "custom" : preset);
+        showStatus("Plugin enabled.");
       }
     } catch (e: unknown) {
       setEnabled(!checked);
@@ -573,24 +625,25 @@ const Content: FC = () => {
     if (!game) return;
     const prevSavedAcPreset = savedAcPreset;
     const prevEditingAc = editingAc;
-    const prevAcSpl = acSpl, prevAcSppt = acSppt, prevAcFppt = acFppt;
+    const prevAcTuning = acTuning;
     setAcSeparate(checked);
-    let useSpl = acSpl, useSppt = acSppt, useFppt = acFppt;
+    let use = acTuning;
     if (checked && savedAcPreset === undefined) {
-      useSpl = spl; useSppt = sppt; useFppt = fppt;
-      setAcSpl(spl); setAcSppt(sppt); setAcFppt(fppt);
+      use = tuning;
+      setAcTuning(tuning);
     }
     if (!checked) {
       setEditingAc(false);
       setSavedAcPreset(undefined);
     }
+    const a = absolute(use);
     try {
-      await setGameAcProfile(game.appId, toMw(useSpl), toMw(useSppt), toMw(useFppt), checked, "");
+      await setGameAcProfile(game.appId, toMw(a.spl), toMw(a.sppt), toMw(a.fppt), checked, "");
     } catch (e: unknown) {
       setAcSeparate(!checked);
       setSavedAcPreset(prevSavedAcPreset);
       setEditingAc(prevEditingAc);
-      setAcSpl(prevAcSpl); setAcSppt(prevAcSppt); setAcFppt(prevAcFppt);
+      setAcTuning(prevAcTuning);
       showStatus(`Error: ${String(e)}`);
     }
   };
@@ -605,28 +658,33 @@ const Content: FC = () => {
       showStatus(`Error: ${String(e)}`);
       return;
     }
-    if (!checked) {
-      const newSpl  = Math.min(spl,   35), newSppt  = Math.min(sppt,   37), newFppt  = Math.min(fppt,   45);
-      const newAcSpl = Math.min(acSpl, 35), newAcSppt = Math.min(acSppt, 37), newAcFppt = Math.min(acFppt, 45);
-      setSpl(newSpl); setSppt(newSppt); setFppt(newFppt);
-      setAcSpl(newAcSpl); setAcSppt(newAcSppt); setAcFppt(newAcFppt);
-      const appId = (perGame && game) ? game.appId : "";
-      try {
-        if (spl !== newSpl || sppt !== newSppt || fppt !== newFppt) {
-          const r = await applyTdp(toMw(newSpl), toMw(newSppt), toMw(newFppt), appId, "custom");
-          setPreset("custom");
-          if (r.success) {
-            if (!appId) { setGlobalProfile({ spl: newSpl, sppt: newSppt, fppt: newFppt, preset: "custom" }); }
-            else setSavedPreset("custom");
-          }
+    if (checked) return;
+
+    // Locking Extras again pulls anything above the firmware ceiling back down.
+    const t  = normalise(tuning,   stdCaps, minW);
+    const at = normalise(acTuning, stdCaps, minW);
+    const tChanged  = !sameTuning(t,  tuning);
+    const atChanged = !sameTuning(at, acTuning);
+    setTuning(t);
+    setAcTuning(at);
+    const appId = (perGame && game) ? game.appId : "";
+    try {
+      if (tChanged) {
+        const a = absolute(t);
+        const r = await applyTdp(toMw(a.spl), toMw(a.sppt), toMw(a.fppt), appId, "custom");
+        setPreset("custom");
+        if (r.success) {
+          if (!appId) setGlobalProfile({ ...a, preset: "custom" });
+          else setSavedPreset("custom");
         }
-        if (acSeparate && appId && (acSpl !== newAcSpl || acSppt !== newAcSppt || acFppt !== newAcFppt)) {
-          const r = await setGameAcProfile(appId, toMw(newAcSpl), toMw(newAcSppt), toMw(newAcFppt), acSeparate, "custom");
-          if (r.success) setSavedAcPreset("custom");
-        }
-      } catch (e: unknown) {
-        showStatus(`Error: ${String(e)}`);
       }
+      if (acSeparate && appId && atChanged) {
+        const a = absolute(at);
+        const r = await setGameAcProfile(appId, toMw(a.spl), toMw(a.sppt), toMw(a.fppt), acSeparate, "custom");
+        if (r.success) setSavedAcPreset("custom");
+      }
+    } catch (e: unknown) {
+      showStatus(`Error: ${String(e)}`);
     }
   };
 
@@ -635,15 +693,16 @@ const Content: FC = () => {
     setLoading(true);
     showStatus(null);
     const appId = (perGame && game) ? game.appId : "";
+    const a = absolute(active);
     try {
       if (editingAc && appId) {
-        const r = await setGameAcProfile(appId, toMw(acSpl), toMw(acSppt), toMw(acFppt), acSeparate, "custom");
+        const r = await setGameAcProfile(appId, toMw(a.spl), toMw(a.sppt), toMw(a.fppt), acSeparate, "custom");
         if (r.success) setSavedAcPreset("custom");
         showStatus(r.success ? `AC profile saved for ${game!.name}.` : `Error: ${r.stderr || "unknown"}`);
       } else {
-        const r = await applyTdp(toMw(spl), toMw(sppt), toMw(fppt), appId, "custom");
+        const r = await applyTdp(toMw(a.spl), toMw(a.sppt), toMw(a.fppt), appId, "custom");
         if (r.success) {
-          if (!appId) { setGlobalProfile({ spl, sppt, fppt, preset: "custom" }); }
+          if (!appId) setGlobalProfile({ ...a, preset: "custom" });
           else setSavedPreset("custom");
         }
         showStatus(r.success
@@ -681,8 +740,8 @@ const Content: FC = () => {
                 <span>
                   <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.5)" }}>Global Profile: </span>
                   <span style={styles.profileTag}>{profileLabel(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, globalProfile.preset)}</span>
-                  {!extrasUnlocked && exceedsStd(globalProfile.spl, globalProfile.sppt, globalProfile.fppt) && (
-                    <span style={{ fontSize: "11px", color: "rgba(251,191,36,0.9)" }}> ⚠ exceeds std limits</span>
+                  {!extrasUnlocked && exceedsCaps(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, stdCaps) && (
+                    <span style={{ fontSize: "11px", color: "rgba(251,191,36,0.9)" }}> ⚠ exceeds firmware limits</span>
                   )}
                 </span>
               ) : "Using system defaults"
@@ -713,18 +772,16 @@ const Content: FC = () => {
                       <span style={{ display: "flex", flexDirection: "column", gap: "1px" }}>
                         <span>
                           <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.5)" }}>Battery: </span>
-                          <span style={styles.profileTag}>{profileLabel(spl, sppt, fppt, savedPreset)}</span>
-                          {!extrasUnlocked && exceedsStd(spl, sppt, fppt) && (
-                            <span style={{ fontSize: "11px", color: "rgba(251,191,36,0.9)" }}> ⚠</span>
-                          )}
+                          <span style={styles.profileTag}>
+                            {profileLabel(absolute(tuning).spl, absolute(tuning).sppt, absolute(tuning).fppt, savedPreset)}
+                          </span>
                         </span>
                         {acSeparate && (
                           <span>
                             <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.5)" }}>AC: </span>
-                            <span style={styles.profileTag}>{profileLabel(acSpl, acSppt, acFppt, savedAcPreset)}</span>
-                            {!extrasUnlocked && exceedsStd(acSpl, acSppt, acFppt) && (
-                              <span style={{ fontSize: "11px", color: "rgba(251,191,36,0.9)" }}> ⚠</span>
-                            )}
+                            <span style={styles.profileTag}>
+                              {profileLabel(absolute(acTuning).spl, absolute(acTuning).sppt, absolute(acTuning).fppt, savedAcPreset)}
+                            </span>
                           </span>
                         )}
                       </span>
@@ -796,26 +853,32 @@ const Content: FC = () => {
             <PanelSection title={editingAc ? "TDP Limits (AC)" : "TDP Limits"}>
               <PanelSectionRow>
                 <SliderField
-                  label={`SPL (Sustained) - ${editingAc ? acSpl : spl} W`}
-                  value={editingAc ? acSpl : spl} min={limits.spl.min} max={limits.spl.max} step={1}
-                  onChange={editingAc ? handleAcSplChange : handleSplChange}
-                  description="ppt_pl1_spl"
+                  label={`SPL (TDP) - ${active.spl} W`}
+                  value={active.spl} min={minW} max={caps.spl} step={1}
+                  onChange={handlers.onSpl}
+                  description="Sustained power limit - the main TDP dial"
                 />
               </PanelSectionRow>
               <PanelSectionRow>
                 <SliderField
-                  label={`SPPT (Slow) - ${editingAc ? acSppt : sppt} W`}
-                  value={editingAc ? acSppt : sppt} min={limits.sppt.min} max={limits.sppt.max} step={1}
-                  onChange={editingAc ? handleAcSpptChange : handleSpptChange}
-                  description="ppt_pl2_sppt"
+                  label={`SPPT +${active.spptOff} W  =  ${active.spl + active.spptOff} W`}
+                  value={active.spptOff} min={0} max={om.sppt || 1} step={1}
+                  disabled={om.sppt === 0}
+                  onChange={handlers.onSppt}
+                  description={om.sppt === 0
+                    ? "No headroom left at this SPL"
+                    : `Slow limit headroom above SPL (max +${om.sppt} W here)`}
                 />
               </PanelSectionRow>
               <PanelSectionRow>
                 <SliderField
-                  label={`FPPT (Fast) - ${editingAc ? acFppt : fppt} W`}
-                  value={editingAc ? acFppt : fppt} min={limits.fppt.min} max={limits.fppt.max} step={1}
-                  onChange={editingAc ? handleAcFpptChange : handleFpptChange}
-                  description="ppt_pl3_fppt"
+                  label={`FPPT +${active.fpptOff} W  =  ${active.spl + active.fpptOff} W`}
+                  value={active.fpptOff} min={0} max={om.fppt || 1} step={1}
+                  disabled={om.fppt === 0}
+                  onChange={handlers.onFppt}
+                  description={om.fppt === 0
+                    ? "No headroom left at this SPL"
+                    : `Fast limit headroom above SPL (max +${om.fppt} W here)`}
                 />
               </PanelSectionRow>
             </PanelSection>
@@ -852,8 +915,10 @@ const Content: FC = () => {
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
-            label="Unlock Custom TDP to 60 W"
-            description={extrasUnlocked ? "Custom slider range extended to 60 W" : "Enable to allow Custom sliders up to 60 W"}
+            label={`Unlock Custom TDP to ${maxCaps.spl} W`}
+            description={extrasUnlocked
+              ? `Custom sliders extended to ${maxCaps.spl} W - applied via ryzenadj instead of firmware`
+              : `Enable to allow Custom sliders up to ${maxCaps.spl} W`}
             checked={extrasUnlocked}
             onChange={handleExtrasUnlockedToggle}
           />

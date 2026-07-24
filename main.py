@@ -10,6 +10,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import pwd
 import threading
 import urllib.request
@@ -28,7 +29,25 @@ GITHUB_API_URL = "https://api.github.com/repos/Rayekkk/LeGoTDP/releases/latest"
 
 DEFAULT_SETTINGS = {"spl": 15000, "sppt": 15000, "fppt": 15000, "enabled": True}
 
+# Absolute floor/ceiling for any single limit, in milliwatts. Applied on load, which
+# also migrates profiles saved back when the Extras ceiling was 60 W.
+HARD_MIN_MW = 5000
+HARD_MAX_MW = 50000
+
+# Lenovo firmware attributes. Writing these goes through the EC instead of poking the
+# SMU directly, so the firmware stops fighting us and the values survive suspend.
+WMI_ROOT  = "/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes"
+WMI_ATTRS = {"spl": "ppt_pl1_spl", "sppt": "ppt_pl2_sppt", "fppt": "ppt_pl3_fppt"}
+PLATFORM_PROFILE_GLOB = "/sys/class/platform-profile/*/profile"
+
+# Package energy counter, used instead of spawning `ryzenadj --info` every 2 s.
+RAPL_GLOB = "/sys/class/powercap/intel-rapl:*"
+
 _ryzenadj_lock = threading.Lock()
+# Serialises every hardware apply. The ryzenadj path has its own lock, but the WMI
+# path (profile bounce + three ppt writes) is not atomic, so concurrent applies from
+# the enforce loop and a user action could interleave and corrupt each other.
+_apply_lock = threading.Lock()
 
 # Cache of last successful --info parse - keeps UI responsive when lock is held
 _info_cache: dict = {}
@@ -89,8 +108,35 @@ def _save_json(path: str, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _clamp_triplet(spl, sppt, fppt) -> tuple:
+    """Enforce 5 W <= spl <= sppt <= fppt <= 50 W (milliwatts).
+
+    SPPT/FPPT are offsets above SPL in the UI, so they can never sit below it.
+    """
+    try:
+        spl, sppt, fppt = int(spl), int(sppt), int(fppt)
+    except (TypeError, ValueError):
+        return DEFAULT_SETTINGS["spl"], DEFAULT_SETTINGS["sppt"], DEFAULT_SETTINGS["fppt"]
+    spl  = max(HARD_MIN_MW, min(spl,  HARD_MAX_MW))
+    fppt = max(spl,         min(fppt, HARD_MAX_MW))
+    sppt = max(spl,         min(sppt, fppt))
+    return spl, sppt, fppt
+
+
 def _load_settings() -> dict:
-    return _load_json(SETTINGS_FILE, DEFAULT_SETTINGS)
+    s = _load_json(SETTINGS_FILE, DEFAULT_SETTINGS)
+    s["spl"], s["sppt"], s["fppt"] = _clamp_triplet(
+        s.get("spl",  DEFAULT_SETTINGS["spl"]),
+        s.get("sppt", DEFAULT_SETTINGS["sppt"]),
+        s.get("fppt", DEFAULT_SETTINGS["fppt"]),
+    )
+    if any(k in s for k in ("active_spl", "active_sppt", "active_fppt")):
+        s["active_spl"], s["active_sppt"], s["active_fppt"] = _clamp_triplet(
+            s.get("active_spl",  s["spl"]),
+            s.get("active_sppt", s["sppt"]),
+            s.get("active_fppt", s["fppt"]),
+        )
+    return s
 
 
 def _save_settings(s: dict) -> None:
@@ -100,7 +146,17 @@ def _save_settings(s: dict) -> None:
 # ── Per-game profiles ──────────────────────────────────────────────────────────
 
 def _load_profiles() -> dict:
-    return _load_json(PROFILES_FILE, {})
+    profiles = _load_json(PROFILES_FILE, {})
+    for p in profiles.values():
+        if not isinstance(p, dict):
+            continue
+        if p.get("spl") is not None:
+            p["spl"], p["sppt"], p["fppt"] = _clamp_triplet(
+                p["spl"], p.get("sppt", p["spl"]), p.get("fppt", p["spl"]))
+        if p.get("ac_spl") is not None:
+            p["ac_spl"], p["ac_sppt"], p["ac_fppt"] = _clamp_triplet(
+                p["ac_spl"], p.get("ac_sppt", p["ac_spl"]), p.get("ac_fppt", p["ac_spl"]))
+    return profiles
 
 
 def _save_profiles(profiles: dict) -> None:
@@ -219,23 +275,237 @@ def _apply_ryzenadj(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
         _ryzenadj_lock.release()
 
 
+# ── Lenovo WMI firmware attributes ─────────────────────────────────────────────
+
+def _wmi_path(key: str, leaf: str) -> str:
+    return os.path.join(WMI_ROOT, WMI_ATTRS[key], leaf)
+
+
+def _wmi_read(key: str, leaf: str) -> Optional[int]:
+    try:
+        with open(_wmi_path(key, leaf)) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _wmi_caps() -> dict:
+    """Firmware-reported {min,max} in watts per parameter, or {} when unavailable."""
+    caps = {}
+    for key in WMI_ATTRS:
+        lo, hi = _wmi_read(key, "min_value"), _wmi_read(key, "max_value")
+        if lo is None or hi is None:
+            return {}
+        caps[key] = {"min": lo, "max": hi}
+    return caps
+
+
+def _profile_path() -> Optional[str]:
+    """The platform-profile node whose choices include 'custom' (the tunable one)."""
+    for path in glob.glob(PLATFORM_PROFILE_GLOB):
+        try:
+            with open(os.path.join(os.path.dirname(path), "choices")) as f:
+                if "custom" in f.read().split():
+                    return path
+        except OSError:
+            continue
+    return None
+
+
+def _read_profile(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _write_profile(path: str, value: str) -> bool:
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+        return True
+    except OSError:
+        return False
+
+
+def _write_ppt(spl_w: int, sppt_w: int, fppt_w: int) -> None:
+    for key, val in (("spl", spl_w), ("sppt", sppt_w), ("fppt", fppt_w)):
+        try:
+            with open(_wmi_path(key, "current_value"), "w") as f:
+                f.write(str(val))
+        except OSError:
+            pass
+
+
+def _ppt_matches(spl_w: int, sppt_w: int, fppt_w: int) -> bool:
+    return all(_wmi_read(k, "current_value") == v
+               for k, v in (("spl", spl_w), ("sppt", sppt_w), ("fppt", fppt_w)))
+
+
+# Verified on the Legion Go 2: the firmware only latches ppt_* writes when the
+# platform profile transitions *into* 'custom'. Writing while already in custom is
+# silently dropped, and entering custom resets the values to firmware defaults - so
+# the reliable recipe is bounce-through-another-profile, then write.
+def _apply_wmi(spl_w: int, sppt_w: int, fppt_w: int) -> dict:
+    path = _profile_path()
+    if path is None:
+        return {"success": False, "stdout": "", "stderr": "no custom platform profile",
+                "returncode": -1}
+
+    # Fast path: if we can latch a write in place, skip the visible profile bounce.
+    if _read_profile(path) == "custom":
+        _write_ppt(spl_w, sppt_w, fppt_w)
+        if _ppt_matches(spl_w, sppt_w, fppt_w):
+            decky.logger.info(f"[legotdp] wmi apply {spl_w}W/{sppt_w}W/{fppt_w}W")
+            return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+
+    # Force a real transition into custom, then write. Bounce via a low profile so the
+    # momentary blip is downward, never a spike.
+    bounce = "low-power"
+    try:
+        with open(os.path.join(os.path.dirname(path), "choices")) as f:
+            choices = f.read().split()
+        bounce = next((c for c in ("low-power", "balanced", "performance") if c in choices),
+                      next((c for c in choices if c != "custom"), "custom"))
+    except OSError:
+        pass
+    _write_profile(path, bounce)
+    if not _write_profile(path, "custom"):
+        return {"success": False, "stdout": "", "stderr": "cannot select custom profile",
+                "returncode": -1}
+    _write_ppt(spl_w, sppt_w, fppt_w)
+
+    if not _ppt_matches(spl_w, sppt_w, fppt_w):
+        mismatch = "; ".join(
+            f"{WMI_ATTRS[k]}={_wmi_read(k, 'current_value')} want {v}"
+            for k, v in (("spl", spl_w), ("sppt", sppt_w), ("fppt", fppt_w))
+            if _wmi_read(k, "current_value") != v)
+        return {"success": False, "stdout": "", "stderr": mismatch, "returncode": -1}
+    decky.logger.info(f"[legotdp] wmi apply {spl_w}W/{sppt_w}W/{fppt_w}W (via bounce)")
+    return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+
+
+# ── RAPL package power ─────────────────────────────────────────────────────────
+
+_rapl_dir: Optional[str] = None
+_rapl_last: tuple = ()
+
+
+def _find_rapl_package() -> Optional[str]:
+    global _rapl_dir
+    if _rapl_dir is None:
+        _rapl_dir = ""
+        for d in sorted(glob.glob(RAPL_GLOB)):
+            try:
+                with open(os.path.join(d, "name")) as f:
+                    if f.read().strip().startswith("package"):
+                        _rapl_dir = d
+                        break
+            except OSError:
+                continue
+    return _rapl_dir or None
+
+
+def _rapl_watts() -> Optional[float]:
+    """Average package draw since the previous call, in watts."""
+    global _rapl_last
+    d = _find_rapl_package()
+    if not d:
+        return None
+    try:
+        with open(os.path.join(d, "energy_uj")) as f:
+            energy = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    now = time.monotonic()
+    prev, _rapl_last = _rapl_last, (energy, now)
+    if not prev:
+        return None
+    delta_e, delta_t = energy - prev[0], now - prev[1]
+    if delta_t <= 0:
+        return None
+    if delta_e < 0:  # counter wrapped
+        try:
+            with open(os.path.join(d, "max_energy_range_uj")) as f:
+                delta_e += int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+    return delta_e / delta_t / 1_000_000
+
+
+# ── Apply dispatcher ───────────────────────────────────────────────────────────
+
+_last_source: str = ""
+
+
+def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
+    """Prefer the firmware path; fall back to ryzenadj only when the request exceeds
+    what the firmware accepts (the Extras range)."""
+    global _last_source
+    spl_mw, sppt_mw, fppt_mw = _clamp_triplet(spl_mw, sppt_mw, fppt_mw)
+    triple_w = (("spl", spl_mw // 1000), ("sppt", sppt_mw // 1000), ("fppt", fppt_mw // 1000))
+    if not _apply_lock.acquire(timeout=8.0):
+        return {"success": False, "stdout": "", "stderr": "apply busy", "returncode": -1}
+    try:
+        caps = _wmi_caps()
+        if caps and all(caps[k]["min"] <= v <= caps[k]["max"] for k, v in triple_w):
+            result = _apply_wmi(*(v for _, v in triple_w))
+            if result["success"]:
+                _last_source = "wmi"
+                return result
+            decky.logger.warning(
+                f"[legotdp] WMI apply failed ({result['stderr']}), falling back to ryzenadj")
+        result = _apply_ryzenadj(spl_mw, sppt_mw, fppt_mw)
+        if result["success"]:
+            _last_source = "ryzenadj"
+        return result
+    finally:
+        _apply_lock.release()
+
+
+def _wmi_profile_lost() -> bool:
+    """True when the last apply was via WMI but the platform profile is no longer
+    'custom', so the ppt_* attributes still read the old values yet no longer bind.
+    Something external (Steam, amd_pmf, gamezone) knocked us off custom."""
+    if _last_source != "wmi":
+        return False
+    path = _profile_path()
+    return path is not None and _read_profile(path) != "custom"
+
+
+def _read_limits() -> dict:
+    """Current limits in watts, read from whichever layer last applied them.
+
+    The two layers do not observe each other: after a ryzenadj write the WMI
+    attributes still report the firmware's own stale bookkeeping, so reading the
+    wrong one would misreport the active limits.
+    """
+    if _last_source == "wmi":
+        vals = {f"{k}_limit": _wmi_read(k, "current_value") for k in WMI_ATTRS}
+        if all(v is not None for v in vals.values()):
+            return {k: float(v) for k, v in vals.items()}
+    if not _ryzenadj_lock.acquire(timeout=4.0):
+        return {}
+    try:
+        rc, out, _ = _run_ryzenadj(["--info"], timeout=3.0)
+    finally:
+        _ryzenadj_lock.release()
+    return _parse_ryzenadj_output(out) if rc == 0 else {}
+
+
 # ── Info cache refresh ─────────────────────────────────────────────────────────
 
 def _refresh_info_cache() -> None:
-    if not _ryzenadj_lock.acquire(blocking=False):
-        return
-    try:
-        rc, out, err = _run_ryzenadj(["--info"], timeout=3.0)
-        if rc != 0:
-            return
-        parsed = _parse_ryzenadj_output(out)
-        with _info_cache_lock:
+    values = _read_limits()
+    watts  = _rapl_watts()
+    with _info_cache_lock:
+        if values:
             _info_cache.clear()
-            _info_cache.update(parsed)
-    except Exception:
-        pass
-    finally:
-        _ryzenadj_lock.release()
+            _info_cache.update(values)
+        if watts is not None:
+            _info_cache["package_draw"] = round(watts, 1)
+        _info_cache["source"] = _last_source or "wmi"
 
 
 # ── Game detection ─────────────────────────────────────────────────────────────
@@ -280,7 +550,7 @@ def _check_and_enforce() -> None:
             if appid in profiles:
                 p = profiles[appid]
                 spl, sppt, fppt = _pick_profile_values(p, ac_now)
-                result = _apply_ryzenadj(spl, sppt, fppt)
+                result = _apply_limits(spl, sppt, fppt)
                 if result["success"]:
                     s = _load_settings()
                     _save_active(s, spl, sppt, fppt)
@@ -293,71 +563,108 @@ def _check_and_enforce() -> None:
             spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
             sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
             fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
-            result = _apply_ryzenadj(spl, sppt, fppt)
+            result = _apply_limits(spl, sppt, fppt)
             if result["success"]:
                 s = _load_settings()
                 _save_active(s, spl, sppt, fppt)
                 decky.logger.info(f"[legotdp] Game launched with no profile, applied global TDP: app={appid}")
+            else:
+                decky.logger.warning(f"[legotdp] Failed to apply global TDP on game launch: app={appid} rc={result['returncode']} err={result['stderr']}")
             return
         elif game_changed and prev:
             spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
             sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
             fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
-            result = _apply_ryzenadj(spl, sppt, fppt)
+            result = _apply_limits(spl, sppt, fppt)
             if result["success"]:
                 s = _load_settings()
                 _save_active(s, spl, sppt, fppt)
                 decky.logger.info("[legotdp] Game exited, restored global TDP")
+            else:
+                decky.logger.warning(f"[legotdp] Failed to restore global TDP on game exit: rc={result['returncode']} err={result['stderr']}")
             return
         elif ac_changed:
             spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
             sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
             fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
-            result = _apply_ryzenadj(spl, sppt, fppt)
+            result = _apply_limits(spl, sppt, fppt)
             if result["success"]:
                 s = _load_settings()
                 _save_active(s, spl, sppt, fppt)
                 decky.logger.info(f"[legotdp] Re-applied global TDP on AC change: ac={ac_now}")
+            else:
+                decky.logger.warning(f"[legotdp] Failed to re-apply global TDP on AC change: ac={ac_now} rc={result['returncode']} err={result['stderr']}")
             return
 
     s = _load_settings()
-    want_spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
-    want_sppt = s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"]))
-    want_fppt = s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"]))
+    _enforce_target(_clamp_triplet(
+        s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
+        s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
+        s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+    ))
+
+
+DRIFT_TOLERANCE_W  = 1.0
+DRIFT_MAX_ATTEMPTS = 3
+
+_drift_target:   tuple = ()
+_drift_settled:  tuple = ()
+_drift_attempts: int   = 0
+
+
+def _enforce_target(want: tuple) -> None:
+    """Re-apply `want` when the hardware has drifted off it.
+
+    Some targets are simply unreachable - the SMU silently caps slow-limit around
+    50 W, for instance - and chasing those forever re-ran ryzenadj every 5 s and
+    flooded the log. After a few failed attempts we accept whatever the hardware
+    settled on, and only act again if it moves away from that.
+    """
+    global _drift_target, _drift_settled, _drift_attempts
+
+    if want != _drift_target:
+        _drift_target, _drift_settled, _drift_attempts = want, (), 0
 
     with _info_cache_lock:
         parsed = dict(_info_cache) if _panel_active else {}
-
     if not parsed:
-        if not _ryzenadj_lock.acquire(timeout=4.0):
-            return
-        try:
-            rc, out, err = _run_ryzenadj(["--info"], timeout=3.0)
-        finally:
-            _ryzenadj_lock.release()
-        if rc != 0:
-            return
-        parsed = _parse_ryzenadj_output(out)
-        with _info_cache_lock:
-            _info_cache.update(parsed)
+        parsed = _read_limits()
+    cur = tuple(parsed.get(f"{k}_limit") for k in ("spl", "sppt", "fppt"))
+    if any(v is None for v in cur):
+        return
 
-    cur_spl  = parsed.get("spl_limit")
-    cur_sppt = parsed.get("sppt_limit")
-    cur_fppt = parsed.get("fppt_limit")
-    want_spl_w  = want_spl  / 1000
-    want_sppt_w = want_sppt / 1000
-    want_fppt_w = want_fppt / 1000
+    want_w    = tuple(v / 1000 for v in want)
+    reference = _drift_settled or want_w
+    # The WMI attributes keep reporting the last value even after the profile leaves
+    # 'custom', so a matching read is not proof the limit is actually enforced - force
+    # a re-apply (which re-selects custom) when we detect that.
+    profile_lost = _wmi_profile_lost()
+    if not profile_lost and all(abs(c - r) <= DRIFT_TOLERANCE_W for c, r in zip(cur, reference)):
+        return
 
-    if (cur_spl  is None or abs(cur_spl  - want_spl_w)  > 1.0 or
-            cur_sppt is None or abs(cur_sppt - want_sppt_w) > 1.0 or
-            cur_fppt is None or abs(cur_fppt - want_fppt_w) > 1.0):
-        decky.logger.info(
-            f"[legotdp] TDP drift spl={cur_spl}->{want_spl_w:.0f}W "
-            f"sppt={cur_sppt}->{want_sppt_w:.0f}W fppt={cur_fppt}->{want_fppt_w:.0f}W, re-applying"
-        )
-        result = _apply_ryzenadj(want_spl, want_sppt, want_fppt)
-        if not result["success"]:
-            decky.logger.warning(f"[legotdp] drift re-apply failed rc={result['returncode']} err={result['stderr']}")
+    if profile_lost:
+        decky.logger.info("[legotdp] platform profile left 'custom', re-asserting limits")
+        _drift_settled, _drift_attempts = (), 0
+
+    if _drift_settled:
+        # Moved off the value we had accepted, so something external changed it.
+        # Give the real target another go.
+        _drift_settled, _drift_attempts = (), 0
+
+    if _drift_attempts >= DRIFT_MAX_ATTEMPTS:
+        _drift_settled = cur
+        decky.logger.warning(
+            f"[legotdp] target {want_w} unreachable after {_drift_attempts} attempts, "
+            f"accepting {cur} and standing down")
+        return
+
+    _drift_attempts += 1
+    decky.logger.info(
+        f"[legotdp] TDP drift {cur} -> {want_w}, re-applying (attempt {_drift_attempts})")
+    result = _apply_limits(*want)
+    if not result["success"]:
+        decky.logger.warning(
+            f"[legotdp] drift re-apply failed rc={result['returncode']} err={result['stderr']}")
 
 
 def _xdg_download_dir(home_dir: str) -> str:
@@ -378,6 +685,7 @@ def _xdg_download_dir(home_dir: str) -> str:
 class Plugin:
     _ready: bool = False
     _setup_error: Optional[str] = None
+    _tasks: list = []
 
     async def is_ready(self) -> dict:
         return {"ready": self._ready, "error": self._setup_error}
@@ -431,13 +739,13 @@ class Plugin:
         ac_now = _get_ac_online()
         loop = asyncio.get_running_loop()
         if ac_now and ac_separate:
-            result = await loop.run_in_executor(None, _apply_ryzenadj, spl, sppt, fppt)
+            result = await loop.run_in_executor(None, _apply_limits, spl, sppt, fppt)
             if result["success"]:
                 s = _load_settings()
                 _save_active(s, spl, sppt, fppt)
             return result
         if ac_now and not ac_separate and p.get("spl") is not None and p.get("sppt") is not None and p.get("fppt") is not None:
-            result = await loop.run_in_executor(None, _apply_ryzenadj, p["spl"], p["sppt"], p["fppt"])
+            result = await loop.run_in_executor(None, _apply_limits, p["spl"], p["sppt"], p["fppt"])
             if result["success"]:
                 s = _load_settings()
                 _save_active(s, p["spl"], p["sppt"], p["fppt"])
@@ -456,16 +764,44 @@ class Plugin:
         _save_settings(s)
         decky.logger.info(f"[legotdp] Plugin enabled={enabled}")
 
+    async def get_caps(self) -> dict:
+        """Slider ceilings in watts. `std` is what the firmware accepts over WMI;
+        `max` is the Extras range, which falls through to ryzenadj."""
+        def _do() -> dict:
+            caps = _wmi_caps()
+            return {
+                "min": min(caps[k]["min"] for k in WMI_ATTRS) if caps else HARD_MIN_MW // 1000,
+                "std": {k: caps[k]["max"] for k in WMI_ATTRS} if caps
+                       else {"spl": 35, "sppt": 37, "fppt": 45},
+                "max": {k: HARD_MAX_MW // 1000 for k in WMI_ATTRS},
+                "wmi": bool(caps),
+            }
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _do)
+
     async def restore_defaults(self) -> dict:
         def _do() -> dict:
-            if not _ryzenadj_lock.acquire(timeout=4.0):
-                return {"success": False, "stdout": "", "stderr": "ryzenadj busy", "returncode": -1}
+            global _drift_target, _drift_settled, _drift_attempts
+            if not _apply_lock.acquire(timeout=8.0):
+                return {"success": False, "stdout": "", "stderr": "apply busy", "returncode": -1}
             try:
-                rc, out, err = _run_ryzenadj(["--max-performance"], timeout=5.0)
-                decky.logger.info(f"[legotdp] restore_defaults rc={rc}")
-                return {"success": rc == 0, "stdout": out, "stderr": err, "returncode": rc}
+                _drift_target, _drift_settled, _drift_attempts = (), (), 0
+                # With WMI present the honest "restore defaults" is handing the profile
+                # back to the firmware, rather than pinning ryzenadj to max performance.
+                path = _profile_path()
+                if _wmi_caps() and path and _write_profile(path, "balanced"):
+                    decky.logger.info("[legotdp] restore_defaults: platform profile -> balanced")
+                    return {"success": True, "stdout": "", "stderr": "", "returncode": 0}
+                if not _ryzenadj_lock.acquire(timeout=4.0):
+                    return {"success": False, "stdout": "", "stderr": "ryzenadj busy", "returncode": -1}
+                try:
+                    rc, out, err = _run_ryzenadj(["--max-performance"], timeout=5.0)
+                    decky.logger.info(f"[legotdp] restore_defaults rc={rc}")
+                    return {"success": rc == 0, "stdout": out, "stderr": err, "returncode": rc}
+                finally:
+                    _ryzenadj_lock.release()
             finally:
-                _ryzenadj_lock.release()
+                _apply_lock.release()
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
@@ -497,7 +833,7 @@ class Plugin:
                 apply_sppt = existing.get("ac_sppt", existing.get("sppt", DEFAULT_SETTINGS["sppt"]))
                 apply_fppt = existing.get("ac_fppt", existing.get("fppt", DEFAULT_SETTINGS["fppt"]))
 
-        result = await loop.run_in_executor(None, _apply_ryzenadj, apply_spl, apply_sppt, apply_fppt)
+        result = await loop.run_in_executor(None, _apply_limits, apply_spl, apply_sppt, apply_fppt)
 
         if result["success"]:
             s = _load_settings()
@@ -557,7 +893,11 @@ class Plugin:
                     None,
                 )
                 downloads_dir = _xdg_download_dir(user.pw_dir) if user else "/home/deck/Downloads"
+                created_dir = not os.path.isdir(downloads_dir)
                 os.makedirs(downloads_dir, exist_ok=True)
+                # Plugin runs as root - hand ownership back so the user can manage the file
+                if user and created_dir:
+                    os.chown(downloads_dir, user.pw_uid, user.pw_gid)
                 dest = os.path.join(downloads_dir, os.path.basename(asset_name))
                 try:
                     os.unlink(dest)
@@ -566,6 +906,8 @@ class Plugin:
                 with urllib.request.urlopen(download_url, context=_ssl_ctx, timeout=60) as resp, \
                      open(dest, "wb") as f:
                     shutil.copyfileobj(resp, f)
+                if user:
+                    os.chown(dest, user.pw_uid, user.pw_gid)
                 decky.logger.info(f"[legotdp] update downloaded to {dest}")
                 return {"success": True, "path": dest}
             except Exception as e:
@@ -596,21 +938,39 @@ class Plugin:
     async def _main(self):
         decky.logger.info("[legotdp] initialising")
         try:
+            global _current_ac_online
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _ensure_ryzenadj)
+            # Seed this so the first enforce pass does not report a phantom AC change.
+            _current_ac_online = await loop.run_in_executor(None, _get_ac_online)
+            wmi = await loop.run_in_executor(None, _wmi_caps)
+            try:
+                await loop.run_in_executor(None, _ensure_ryzenadj)
+            except Exception as e:
+                # Only fatal when there is no firmware path to fall back on.
+                if not wmi:
+                    raise
+                decky.logger.warning(
+                    f"[legotdp] ryzenadj unavailable ({e}); Extras range disabled")
             self._ready = True
-            asyncio.create_task(self._enforce_loop())
-            asyncio.create_task(self._info_loop())
-            decky.logger.info("[legotdp] ready")
+            # Keep references - a bare create_task() may be garbage-collected mid-run.
+            self._tasks = [
+                asyncio.create_task(self._enforce_loop()),
+                asyncio.create_task(self._info_loop()),
+            ]
+            decky.logger.info(
+                f"[legotdp] ready (wmi={'yes' if wmi else 'no'}, "
+                f"ryzenadj={'yes' if os.path.isfile(BIN_PATH) else 'no'})")
             s = _load_settings()
             if s.get("enabled", True):
                 spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
                 sppt = s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"]))
                 fppt = s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"]))
-                await loop.run_in_executor(None, _apply_ryzenadj, spl, sppt, fppt)
+                await loop.run_in_executor(None, _apply_limits, spl, sppt, fppt)
         except Exception as e:
             self._setup_error = str(e)
             decky.logger.error(f"[legotdp] setup failed: {e}")
 
     async def _unload(self):
+        for t in self._tasks:
+            t.cancel()
         decky.logger.info("[legotdp] unloaded")

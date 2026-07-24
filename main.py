@@ -656,7 +656,13 @@ def _check_and_enforce() -> None:
     ))
 
 
-DRIFT_TOLERANCE_W  = 1.0
+# WMI reads back the exact value we wrote, so a tight tolerance is right there. The
+# ryzenadj path reports STAPM LIMIT for SPL, which the firmware manages dynamically
+# (it drifts several watts below the set point under load), so comparing it tightly
+# made the loop re-apply forever. A wide band there still catches a real reset - after
+# resume the SMU drops to firmware defaults, which is a double-digit gap.
+DRIFT_TOLERANCE_WMI_W      = 1.0
+DRIFT_TOLERANCE_RYZENADJ_W = 6.0
 DRIFT_MAX_ATTEMPTS = 3
 
 _drift_target:   tuple = ()
@@ -687,11 +693,12 @@ def _enforce_target(want: tuple) -> None:
 
     want_w    = tuple(v / 1000 for v in want)
     reference = _drift_settled or want_w
+    tolerance = DRIFT_TOLERANCE_WMI_W if _last_source == "wmi" else DRIFT_TOLERANCE_RYZENADJ_W
     # The WMI attributes keep reporting the last value even after the profile leaves
     # 'custom', so a matching read is not proof the limit is actually enforced - force
     # a re-apply (which re-selects custom) when we detect that.
     profile_lost = _wmi_profile_lost()
-    if not profile_lost and all(abs(c - r) <= DRIFT_TOLERANCE_W for c, r in zip(cur, reference)):
+    if not profile_lost and all(abs(c - r) <= tolerance for c, r in zip(cur, reference)):
         return
 
     if profile_lost:

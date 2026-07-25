@@ -483,6 +483,56 @@ class UnreadableSpl(unittest.TestCase):
                              for c, w in zip(cur, want_w)))
 
 
+class StaleInfoCache(unittest.TestCase):
+    """The panel's info cache is refreshed on its own two-second cadence, so a
+    pass running right after an apply could read a snapshot taken before it -
+    reporting a drift that never happened and spending an apply on it."""
+
+    def setUp(self):
+        seed(FIXTURE)
+        for name in ("_info_cache_ts", "_applied_at", "_panel_active",
+                     "_panel_active_ts", "_last_source"):
+            self.addCleanup(setattr, main, name, getattr(main, name))
+        self._restore = {n: getattr(main, n) for n in
+                         ("_apply_limits", "_read_limits", "_wmi_limits_overridden")}
+        self.addCleanup(lambda: [setattr(main, n, v)
+                                 for n, v in self._restore.items()])
+        self.reads = 0
+
+        def counting_read():
+            self.reads += 1
+            return {"spl_limit": 20.0, "sppt_limit": 25.0, "fppt_limit": 30.0}
+
+        self.applies = []
+        main._read_limits = counting_read
+        main._apply_limits = lambda *a: self.applies.append(a) or {
+            "success": True, "stdout": "", "stderr": "", "returncode": 0}
+        main._wmi_limits_overridden = lambda want: False
+        main._last_source = "wmi"
+        main._panel_active, main._panel_active_ts = True, main.time.monotonic()
+        main._drift_target = main._drift_settled = ()
+        main._drift_attempts = 0
+        # A cache holding the pre-change reading.
+        with main._info_cache_lock:
+            main._info_cache.clear()
+            main._info_cache.update(
+                {"spl_limit": 38.0, "sppt_limit": 43.0, "fppt_limit": 48.0})
+
+    def test_a_cache_older_than_the_apply_is_ignored(self):
+        now = main.time.monotonic()
+        main._info_cache_ts, main._applied_at = now - 2.0, now - 1.0
+        main._enforce_target((20000, 25000, 30000))
+        self.assertEqual(self.reads, 1, "should have gone for a fresh read")
+        self.assertEqual(self.applies, [], "the fresh read matches, so nothing to do")
+
+    def test_a_cache_newer_than_the_apply_is_used(self):
+        now = main.time.monotonic()
+        main._info_cache_ts, main._applied_at = now - 1.0, now - 2.0
+        main._enforce_target((38000, 43000, 48000))
+        self.assertEqual(self.reads, 0, "the cache was current, no read needed")
+        self.assertEqual(self.applies, [])
+
+
 class WmiCrossCheck(unittest.TestCase):
     """The firmware attributes only record what was written through them, so an
     override that bypasses that interface is invisible there. Measured on the

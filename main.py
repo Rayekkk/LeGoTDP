@@ -73,6 +73,7 @@ _apply_lock = threading.Lock()
 
 # Cache of last successful --info parse - keeps UI responsive when lock is held
 _info_cache: dict = {}
+_info_cache_ts: float = 0.0
 _info_cache_lock = threading.Lock()
 
 _ROW_RE = re.compile(r"\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|")
@@ -595,11 +596,15 @@ _last_source: str = ""
 # see _adopt_unreadable_spl().
 _applied_mw: tuple = ()
 
+# When that happened, so the enforce pass can tell whether the info cache it is
+# about to read predates the change it is checking.
+_applied_at: float = 0.0
+
 
 def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
     """Prefer the firmware path; fall back to ryzenadj only when the request exceeds
     what the firmware accepts (the Extras range)."""
-    global _last_source, _applied_mw
+    global _last_source, _applied_mw, _applied_at
     spl_mw, sppt_mw, fppt_mw = _clamp_triplet(spl_mw, sppt_mw, fppt_mw)
     triple_w = (("spl", spl_mw // 1000), ("sppt", sppt_mw // 1000), ("fppt", fppt_mw // 1000))
     if not _apply_lock.acquire(timeout=8.0):
@@ -610,7 +615,7 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
             result = _apply_wmi(*(v for _, v in triple_w))
             if result["success"]:
                 _last_source = "wmi"
-                _applied_mw = (spl_mw, sppt_mw, fppt_mw)
+                _applied_mw, _applied_at = (spl_mw, sppt_mw, fppt_mw), time.monotonic()
                 _invalidate_limits_cache()
                 return result
             decky.logger.warning(
@@ -618,7 +623,7 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
         result = _apply_ryzenadj(spl_mw, sppt_mw, fppt_mw)
         if result["success"]:
             _last_source = "ryzenadj"
-            _applied_mw = (spl_mw, sppt_mw, fppt_mw)
+            _applied_mw, _applied_at = (spl_mw, sppt_mw, fppt_mw), time.monotonic()
             _invalidate_limits_cache()
         return result
     finally:
@@ -764,9 +769,11 @@ def _read_limits() -> dict:
 # ── Info cache refresh ─────────────────────────────────────────────────────────
 
 def _refresh_info_cache() -> None:
+    global _info_cache_ts
     values = _read_limits()
     watts  = _rapl_watts()
     with _info_cache_lock:
+        _info_cache_ts = time.monotonic()
         if values:
             _info_cache.clear()
             _info_cache.update(values)
@@ -917,8 +924,14 @@ def _enforce_target(want: tuple) -> None:
     if want != _drift_target:
         _drift_target, _drift_settled, _drift_attempts = want, (), 0
 
+    # Only reuse the panel's cache if it was filled after the last apply. It is
+    # refreshed on its own two-second cadence, so a pass running right after a
+    # change would otherwise compare the new target against a snapshot taken
+    # before it - which reported a drift that had not happened and spent a
+    # redundant apply correcting it. Visible in the journal as a "TDP drift"
+    # line one second after every slider move.
     with _info_cache_lock:
-        parsed = dict(_info_cache) if _panel_is_active() else {}
+        parsed = dict(_info_cache) if _panel_is_active() and _info_cache_ts > _applied_at else {}
     if not parsed:
         parsed = _read_limits()
     cur = tuple(parsed.get(f"{k}_limit") for k in ("spl", "sppt", "fppt"))

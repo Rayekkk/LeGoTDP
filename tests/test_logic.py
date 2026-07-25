@@ -414,6 +414,75 @@ class LimitsCache(unittest.TestCase):
         self.assertEqual(main._read_limits(), {})
 
 
+class UnreadableSpl(unittest.TestCase):
+    """STAPM LIMIT follows the fast limit rather than the value passed to
+    --stapm-limit, so the panel's SPL row was really showing FPPT and the
+    enforce loop chased a number the hardware would never return."""
+
+    def setUp(self):
+        self._applied = main._applied_mw
+        self.addCleanup(setattr, main, "_applied_mw", self._applied)
+
+    def test_a_settled_stapm_is_replaced_by_what_we_applied(self):
+        main._applied_mw = (25000, 33000, 47000)
+        parsed = main._adopt_unreadable_spl(
+            {"spl_limit": 47.0, "sppt_limit": 33.0, "fppt_limit": 47.0})
+        self.assertEqual(parsed["spl_limit"], 25.0)
+        # The two the hardware does honour must pass through untouched.
+        self.assertEqual((parsed["sppt_limit"], parsed["fppt_limit"]), (33.0, 47.0))
+
+    def test_a_wobbling_stapm_is_replaced_too(self):
+        # The SMU moves it by a few hundred milliwatts, so an exact match
+        # against fppt is not a usable trigger - 46.643 against a 47 fast limit
+        # is a real reading from the device.
+        main._applied_mw = (40000, 45000, 47000)
+        parsed = main._adopt_unreadable_spl(
+            {"spl_limit": 46.643, "sppt_limit": 45.0, "fppt_limit": 47.0})
+        self.assertEqual(parsed["spl_limit"], 40.0)
+
+    def test_a_reading_taken_mid_transit_is_replaced_too(self):
+        # Sampled a second after a change it sits between the old value and the
+        # new one; 49.746 against a 47 fast limit is also a real reading.
+        main._applied_mw = (40000, 45000, 47000)
+        parsed = main._adopt_unreadable_spl(
+            {"spl_limit": 49.746, "sppt_limit": 45.0, "fppt_limit": 47.0})
+        self.assertEqual(parsed["spl_limit"], 40.0)
+
+    def test_nothing_is_invented_before_the_first_apply(self):
+        main._applied_mw = ()
+        parsed = main._adopt_unreadable_spl(
+            {"spl_limit": 47.0, "sppt_limit": 33.0, "fppt_limit": 47.0})
+        self.assertEqual(parsed["spl_limit"], 47.0)
+
+    def test_a_partial_read_is_not_touched(self):
+        main._applied_mw = (25000, 33000, 47000)
+        self.assertEqual(main._adopt_unreadable_spl({"sppt_limit": 33.0}),
+                         {"sppt_limit": 33.0})
+
+    def test_the_drift_check_stops_chasing_the_unreadable_row(self):
+        # The whole point: the SPL comparison could never succeed, so every
+        # target change burned DRIFT_MAX_ATTEMPTS re-applies before standing
+        # down - visible in the journal as three applies per slider move.
+        main._applied_mw = (25000, 33000, 47000)
+        parsed = main._adopt_unreadable_spl(
+            {"spl_limit": 47.0, "sppt_limit": 33.0, "fppt_limit": 47.0})
+        cur = tuple(parsed[f"{k}_limit"] for k in ("spl", "sppt", "fppt"))
+        want_w = tuple(v / 1000 for v in main._applied_mw)
+        self.assertTrue(all(abs(c - w) <= main.DRIFT_TOLERANCE_RYZENADJ_W
+                            for c, w in zip(cur, want_w)))
+
+    def test_a_real_drift_is_still_caught_through_the_other_two(self):
+        # A post-resume reset moves fast and slow, which are exact, so
+        # substituting SPL does not blind the enforce loop.
+        main._applied_mw = (40000, 45000, 47000)
+        parsed = main._adopt_unreadable_spl(
+            {"spl_limit": 35.0, "sppt_limit": 15.0, "fppt_limit": 25.0})
+        cur = tuple(parsed[f"{k}_limit"] for k in ("spl", "sppt", "fppt"))
+        want_w = tuple(v / 1000 for v in main._applied_mw)
+        self.assertFalse(all(abs(c - w) <= main.DRIFT_TOLERANCE_RYZENADJ_W
+                             for c, w in zip(cur, want_w)))
+
+
 class RaplDiscovery(unittest.TestCase):
     def setUp(self):
         self._dir, self._ts = main._rapl_dir, main._rapl_probed_at

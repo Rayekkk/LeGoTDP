@@ -108,6 +108,13 @@ Live limits plus package draw read from the RAPL energy counter. It only refresh
 **Extras**
 Unlocks the Custom sliders up to 50 W, applied through `ryzenadj` instead of the firmware. This overrides the manufacturer's safety limits - use at your own risk.
 
+One caveat on this path: SPPT and FPPT read back exactly, but SPL does not. On Strix
+Point the `STAPM LIMIT` register that `ryzenadj --info` reports follows the fast limit
+rather than the value passed to `--stapm-limit`, and the SMU keeps nudging it while it
+manages the budget - so it is not a usable read-back. The panel therefore shows the SPL
+the plugin applied rather than a number the hardware will not report. Below the firmware
+ceiling none of this applies: limits go through WMI and all three read back exact.
+
 ---
 
 ## TDP parameters

@@ -590,11 +590,16 @@ def _rapl_watts() -> float | None:
 
 _last_source: str = ""
 
+# The triplet the hardware was last successfully asked for, in milliwatts.
+# Needed because one of the three is not readable back on the ryzenadj path -
+# see _adopt_unreadable_spl().
+_applied_mw: tuple = ()
+
 
 def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
     """Prefer the firmware path; fall back to ryzenadj only when the request exceeds
     what the firmware accepts (the Extras range)."""
-    global _last_source
+    global _last_source, _applied_mw
     spl_mw, sppt_mw, fppt_mw = _clamp_triplet(spl_mw, sppt_mw, fppt_mw)
     triple_w = (("spl", spl_mw // 1000), ("sppt", sppt_mw // 1000), ("fppt", fppt_mw // 1000))
     if not _apply_lock.acquire(timeout=8.0):
@@ -605,6 +610,7 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
             result = _apply_wmi(*(v for _, v in triple_w))
             if result["success"]:
                 _last_source = "wmi"
+                _applied_mw = (spl_mw, sppt_mw, fppt_mw)
                 _invalidate_limits_cache()
                 return result
             decky.logger.warning(
@@ -612,6 +618,7 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
         result = _apply_ryzenadj(spl_mw, sppt_mw, fppt_mw)
         if result["success"]:
             _last_source = "ryzenadj"
+            _applied_mw = (spl_mw, sppt_mw, fppt_mw)
             _invalidate_limits_cache()
         return result
     finally:
@@ -647,6 +654,37 @@ def _invalidate_limits_cache() -> None:
         _limits_cache, _limits_cache_ts = {}, 0.0
 
 
+def _adopt_unreadable_spl(parsed: dict) -> dict:
+    """Replace the STAPM read-back, which does not report what we asked for.
+
+    Measured on a Legion Go 2 (Strix Point, ryzenadj 0.19.0) by sampling for a
+    minute after each change with the plugin stopped:
+
+        set stapm=15 slow=18 fast=25  ->  STAPM settles on 25.0, held for 60 s
+        set stapm=40 slow=45 fast=47  ->  STAPM settles on ~46.6, wobbling
+        set stapm=50 slow=50 fast=50  ->  STAPM settles on 50.0
+
+    STAPM LIMIT follows the fast limit, never the value handed to
+    --stapm-limit, and the SMU moves it by a few hundred milliwatts while it
+    manages the budget. Sampled a second after a change it is somewhere in
+    transit between the old value and the new one - which is where readings
+    like 34.880 and 49.746 come from, and why matching it against fppt exactly
+    does not work.
+
+    Taking the row at face value put the FPPT number in the panel's SPL row,
+    and handed the enforce loop a target it could never reach: three wasted
+    ryzenadj re-applies on every change before it gave up and stood down.
+
+    SPL is therefore not observable on this layer, so report what was applied.
+    Slow and fast are honoured exactly, so drift is still caught through them -
+    including a post-resume reset, which moves all three. The WMI path does not
+    come through here; there all three are real registers and read back exact.
+    """
+    if _applied_mw and "spl_limit" in parsed:
+        parsed["spl_limit"] = _applied_mw[0] / 1000
+    return parsed
+
+
 def _read_limits() -> dict:
     """Current limits in watts, read from whichever layer last applied them.
 
@@ -671,7 +709,7 @@ def _read_limits() -> dict:
     finally:
         _ryzenadj_lock.release()
 
-    parsed = _parse_ryzenadj_output(out) if rc == 0 else {}
+    parsed = _adopt_unreadable_spl(_parse_ryzenadj_output(out)) if rc == 0 else {}
     if parsed:
         with _limits_cache_lock:
             _limits_cache, _limits_cache_ts = dict(parsed), time.monotonic()

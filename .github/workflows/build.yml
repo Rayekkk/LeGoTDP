@@ -73,9 +73,33 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checkout first: it cleans the workspace, which would take the artifact
+      # with it. Needed here only for CHANGELOG.md.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: LeGoTDP
+
+      # Release notes are written by hand in CHANGELOG.md, not generated from
+      # commits: with no pull requests to summarise, --generate-notes produces
+      # little more than a compare link.
+      - name: Take the release notes from the changelog
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          awk -v tag="$TAG" '
+            $0 ~ "^## \\[" tag "\\]" { found = 1; next }
+            found && /^## / { exit }
+            found
+          ' CHANGELOG.md > notes.md
+          # Failing the release beats publishing an empty one.
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for $TAG"
+            exit 1
+          fi
+          echo "--- notes for $TAG ---"
+          cat notes.md
 
       - name: Publish release
         env:
@@ -84,5 +108,5 @@ jobs:
         run: |
           gh release create "$TAG" LeGoTDP-*.zip \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --generate-notes
+            --title "LeGoTDP $TAG" \
+            --notes-file notes.md

@@ -99,6 +99,28 @@ class Persistence(unittest.TestCase):
         self.assertEqual(s["spl"], main.DEFAULT_SETTINGS["spl"])
         self.assertEqual(main._load_profiles(), {})
 
+    def test_an_unsaved_edit_never_reaches_the_disk(self):
+        # getSetting returns a live reference into the manager's own dict, and
+        # every caller here clamps and mutates what it gets back. Without a
+        # private copy an unrelated commit - saving a game profile, say -
+        # flushes those uncommitted edits to disk along with it.
+        s = main._load_settings()
+        s["spl"] = 31000
+        main._save_profiles({"1": {"spl": 8000, "sppt": 8000, "fppt": 8000}})
+        with open(main.settings.path) as handle:
+            self.assertEqual(json.load(handle)["settings"]["spl"], 15000)
+
+    def test_an_unsaved_profile_edit_never_reaches_the_disk(self):
+        profiles = main._load_profiles()
+        profiles[GAME_WITH_PROFILE]["spl"] = 9000
+        # Any commit will do - it writes the manager's whole dict, not just the
+        # key being saved.
+        main.settings.setSetting("unrelated_key", True)
+        main.settings.commit()
+        with open(main.settings.path) as handle:
+            stored = json.load(handle)["game_profiles"][GAME_WITH_PROFILE]
+        self.assertEqual(stored["spl"], 25000)
+
     def test_save_active_does_not_disturb_the_saved_target(self):
         s = main._load_settings()
         main._save_active(s, 30000, 31000, 32000)

@@ -240,6 +240,10 @@ const styles = {
 
 type GameListener = (game: RunningGame | null) => void;
 
+// The backend trusts a frontend-reported appid for 12 seconds. Refresh at half
+// that, so one dropped call is not enough to make it fall back to the /proc scan.
+const PUSH_INTERVAL_MS = 6000;
+
 /**
  * Tracks the foreground game and tells the backend about it, so the backend's
  * enforce loop applies the right per-game profile even for titles its
@@ -261,6 +265,7 @@ class AppWatcher {
   private static unsubs: Array<() => void> = [];
   private static started = false;
   private static busy = false;
+  private static lastPush = 0;
 
   static activeGame(): RunningGame | null {
     try {
@@ -320,6 +325,7 @@ class AppWatcher {
     this.listeners = [];
     this.current = null;
     this.started = false;
+    this.lastPush = 0;
   }
 
   private static async check() {
@@ -327,14 +333,23 @@ class AppWatcher {
     const game = this.activeGame();
     const changed = game?.appId !== this.current?.appId;
     this.current = game;
-    this.busy = true;
-    try {
-      await setActiveApp(game?.appId ?? "");
-    } catch (e) {
-      console.error("[legotdp] setActiveApp failed", e);
-    } finally {
-      this.busy = false;
+
+    // Tick often so a change is noticed quickly, but only send when there is
+    // something to say or the backend's 12 s freshness window is running out.
+    // This runs for the whole session, including mid-game with the panel shut.
+    const now = Date.now();
+    if (changed || now - this.lastPush >= PUSH_INTERVAL_MS) {
+      this.busy = true;
+      try {
+        await setActiveApp(game?.appId ?? "");
+        this.lastPush = now;
+      } catch (e) {
+        console.error("[legotdp] setActiveApp failed", e);
+      } finally {
+        this.busy = false;
+      }
     }
+
     if (changed) this.listeners.forEach((fn) => fn(game));
   }
 }

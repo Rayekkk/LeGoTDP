@@ -1,5 +1,6 @@
 import decky
 import asyncio
+import copy
 import glob
 import json
 import os
@@ -155,10 +156,14 @@ _settings_lock = threading.RLock()
 
 
 def _read_key(key: str, default: dict) -> dict:
+    """A private copy of one key. Callers clamp and mutate what they get back,
+    and getSetting hands out a live reference into the manager's own dict - so
+    without the copy those edits would land in the store uncommitted, and a
+    later read() would silently drop them again."""
     with _settings_lock:
         settings.read()
         value = settings.getSetting(key, None)
-    return value if isinstance(value, dict) else dict(default)
+        return copy.deepcopy(value) if isinstance(value, dict) else dict(default)
 
 
 def _write_key(key: str, value: dict) -> None:
@@ -650,6 +655,27 @@ def _scan_proc_for_appid() -> str:
 
 # ── TDP enforce ────────────────────────────────────────────────────────────────
 
+def _global_triplet(s: dict) -> tuple[int, int, int]:
+    return (s.get("spl",  DEFAULT_SETTINGS["spl"]),
+            s.get("sppt", DEFAULT_SETTINGS["sppt"]),
+            s.get("fppt", DEFAULT_SETTINGS["fppt"]))
+
+
+def _apply_and_record(spl: int, sppt: int, fppt: int, why: str) -> None:
+    """Apply a triplet and remember it as the target the enforce pass defends."""
+    result = _apply_limits(spl, sppt, fppt)
+    if result["success"]:
+        # Re-read rather than reuse the caller's copy: an RPC handler may have
+        # written the store since, and _save_active rewrites the whole object.
+        _save_active(_load_settings(), spl, sppt, fppt)
+        decky.logger.info(
+            f"[legotdp] Applied {why}: {spl // 1000}/{sppt // 1000}/{fppt // 1000} W")
+    else:
+        decky.logger.warning(
+            f"[legotdp] Failed to apply {why}: "
+            f"rc={result['returncode']} err={result['stderr']}")
+
+
 def _check_and_enforce() -> None:
     global _current_game_id, _current_ac_online
 
@@ -668,58 +694,25 @@ def _check_and_enforce() -> None:
         prev = _current_game_id if game_changed else appid
         _current_game_id = appid
 
-        if appid:
-            profiles = _load_profiles()
-            if appid in profiles:
-                p = profiles[appid]
-                spl, sppt, fppt = _pick_profile_values(p, ac_now)
-                result = _apply_limits(spl, sppt, fppt)
-                if result["success"]:
-                    s = _load_settings()
-                    _save_active(s, spl, sppt, fppt)
-                    reason = "AC state change" if ac_changed else "game launch"
-                    decky.logger.info(f"[legotdp] Auto-applied game profile ({reason}): app={appid} ac={ac_now}")
-                else:
-                    decky.logger.warning(f"[legotdp] Failed to apply game profile: app={appid} rc={result['returncode']} err={result['stderr']}")
-                return
-            # Game running but no profile — apply global TDP to avoid enforcing stale active_*
-            spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
-            sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
-            fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
-            result = _apply_limits(spl, sppt, fppt)
-            if result["success"]:
-                s = _load_settings()
-                _save_active(s, spl, sppt, fppt)
-                decky.logger.info(f"[legotdp] Game launched with no profile, applied global TDP: app={appid}")
-            else:
-                decky.logger.warning(f"[legotdp] Failed to apply global TDP on game launch: app={appid} rc={result['returncode']} err={result['stderr']}")
-            return
-        elif game_changed and prev:
-            spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
-            sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
-            fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
-            result = _apply_limits(spl, sppt, fppt)
-            if result["success"]:
-                s = _load_settings()
-                _save_active(s, spl, sppt, fppt)
-                decky.logger.info("[legotdp] Game exited, restored global TDP")
-            else:
-                decky.logger.warning(f"[legotdp] Failed to restore global TDP on game exit: rc={result['returncode']} err={result['stderr']}")
-            return
-        elif ac_changed:
-            spl  = s.get("spl",  DEFAULT_SETTINGS["spl"])
-            sppt = s.get("sppt", DEFAULT_SETTINGS["sppt"])
-            fppt = s.get("fppt", DEFAULT_SETTINGS["fppt"])
-            result = _apply_limits(spl, sppt, fppt)
-            if result["success"]:
-                s = _load_settings()
-                _save_active(s, spl, sppt, fppt)
-                decky.logger.info(f"[legotdp] Re-applied global TDP on AC change: ac={ac_now}")
-            else:
-                decky.logger.warning(f"[legotdp] Failed to re-apply global TDP on AC change: ac={ac_now} rc={result['returncode']} err={result['stderr']}")
+        profile = _load_profiles().get(appid) if appid else None
+        if profile is not None:
+            trigger = "AC state change" if ac_changed else "game launch"
+            _apply_and_record(*_pick_profile_values(profile, ac_now),
+                              f"game profile for app={appid} on {trigger} (ac={ac_now})")
             return
 
-    s = _load_settings()
+        # Nothing per-game applies, so the global settings are what should be
+        # running. Skipping this would leave the enforce pass below defending a
+        # stale active_* triplet left over from whatever ran last.
+        if appid:
+            why = f"global TDP, app={appid} has no profile"
+        elif prev:
+            why = "global TDP, game exited"
+        else:
+            why = f"global TDP on AC change (ac={ac_now})"
+        _apply_and_record(*_global_triplet(s), why)
+        return
+
     _enforce_target(_clamp_triplet(
         s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
         s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),

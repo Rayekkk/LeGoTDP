@@ -4,42 +4,40 @@ import glob
 import json
 import os
 import re
-import ssl
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
-import pwd
 import threading
-import urllib.parse
-import urllib.request
-from typing import Optional
+from settings import SettingsManager
 
-PLUGIN_DIR    = os.path.dirname(os.path.abspath(__file__))
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, PLUGIN_DIR)
+
+from updater import Updater  # noqa: E402 - needs the sys.path line above
+
 BIN_DIR       = os.path.join(PLUGIN_DIR, "bin")
 BIN_PATH      = os.path.join(BIN_DIR, "ryzenadj")
-SETTINGS_FILE = os.path.join(PLUGIN_DIR, "settings.json")
-PROFILES_FILE = os.path.join(PLUGIN_DIR, "profiles.json")
 RYZENADJ_URL  = (
     "https://github.com/FlyGoat/RyzenAdj/releases/download/v0.19.0/"
     "ryzenadj-manylinux_2_28-x86_64.tar.gz"
 )
-GITHUB_API_URL = "https://api.github.com/repos/Rayekkk/LeGoTDP/releases/latest"
+GITHUB_RELEASES_URL = "https://api.github.com/repos/Rayekkk/LeGoTDP/releases/latest"
 
-# Only these hosts may be fetched by the downloader. The plugin runs as root and
-# executes what it downloads (ryzenadj), so an unrestricted URL would be an
-# arbitrary-fetch-and-run primitive.
-_ALLOWED_HOSTS = frozenset({
-    "api.github.com",
-    "github.com",
-    "codeload.github.com",
-    "objects.githubusercontent.com",
-    "release-assets.githubusercontent.com",
-})
-
-# Refuse absurd downloads. The ryzenadj tarball and release zips are a few MB.
-_MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
+# Update checks, TLS trust store and downloads live in updater.py, which is kept
+# identical in LeGo-Vibe-Control so a fix lands in both plugins. The host
+# allowlist there matters more here than there: this plugin executes what it
+# downloads, so an unrestricted URL would be a fetch-and-run primitive.
+updater = Updater(
+    releases_url=GITHUB_RELEASES_URL,
+    user_agent="LeGoTDP",
+    log_prefix="[legotdp]",
+    plugin_dir=PLUGIN_DIR,
+    logger=decky.logger,
+)
 
 DEFAULT_SETTINGS = {"spl": 15000, "sppt": 15000, "fppt": 15000, "enabled": True}
 
@@ -68,99 +66,6 @@ _info_cache: dict = {}
 _info_cache_lock = threading.Lock()
 
 _ROW_RE = re.compile(r"\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|")
-
-# Decky runs plugins inside a PyInstaller-frozen PluginLoader whose OpenSSL has its
-# CA paths baked in from the build machine. They do not exist on the device, so
-# ssl.create_default_context() comes back with an empty trust store and every request
-# dies with CERTIFICATE_VERIFY_FAILED - which is what the old CERT_NONE worked around.
-# Point the context at a real bundle instead of turning verification off.
-_CA_BUNDLES = (
-    "/etc/ssl/certs/ca-certificates.crt",   # Arch, SteamOS, Debian
-    "/etc/ssl/cert.pem",                    # Alpine, macOS, also present on SteamOS
-    "/etc/pki/tls/certs/ca-bundle.crt",     # Fedora, RHEL
-    "/etc/ssl/ca-bundle.pem",               # openSUSE
-)
-
-_ssl_ctx: Optional[ssl.SSLContext] = None
-
-
-def _ssl_context() -> ssl.SSLContext:
-    global _ssl_ctx
-    if _ssl_ctx is not None:
-        return _ssl_ctx
-
-    ctx = ssl.create_default_context()
-    if ctx.cert_store_stats().get("x509_ca"):
-        decky.logger.info("[legotdp] TLS: using the default trust store")
-        _ssl_ctx = ctx
-        return ctx
-
-    # Prefer the OS bundle (it gets security updates) over the copy of certifi the
-    # frozen loader unpacks into a /tmp/_MEI* dir that changes on every restart.
-    candidates = list(_CA_BUNDLES)
-    try:
-        import certifi
-        candidates.append(certifi.where())
-    except Exception:
-        pass
-
-    for path in candidates:
-        try:
-            if not path or not os.path.exists(path):
-                continue
-            ctx.load_verify_locations(cafile=path)
-            if ctx.cert_store_stats().get("x509_ca"):
-                decky.logger.info(
-                    f"[legotdp] TLS: default store was empty, loaded CA bundle {path} "
-                    f"({ctx.cert_store_stats()['x509_ca']} certs)")
-                _ssl_ctx = ctx
-                return ctx
-        except OSError as exc:
-            decky.logger.warning(f"[legotdp] TLS: cannot load {path}: {exc}")
-
-    # Verification stays on. Failing loudly beats silently trusting anything, since
-    # this runs as root and downloads a binary it then executes.
-    decky.logger.error("[legotdp] TLS: no usable CA bundle found, downloads will fail to verify")
-    _ssl_ctx = ctx
-    return ctx
-
-
-def _checked_url(url: str) -> str:
-    """Reject anything that is not an https URL on a known GitHub host."""
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != "https":
-        raise ValueError(f"refusing non-https URL scheme '{parsed.scheme}'")
-    if (parsed.hostname or "").lower() not in _ALLOWED_HOSTS:
-        raise ValueError(f"refusing download from untrusted host '{parsed.hostname}'")
-    return url
-
-
-def _open_url(url: str, timeout: int, headers: Optional[dict] = None):
-    """urlopen with certificate verification left switched on and the host checked."""
-    request = urllib.request.Request(
-        _checked_url(url),
-        headers=headers or {"User-Agent": "LeGoTDP"},
-    )
-    return urllib.request.urlopen(request, context=_ssl_context(), timeout=timeout)
-
-
-def _download_to(url: str, out, timeout: int) -> int:
-    """Stream a URL into a file object, aborting past the size ceiling. Returns bytes."""
-    written = 0
-    with _open_url(url, timeout=timeout) as resp:
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            written += len(chunk)
-            if written > _MAX_DOWNLOAD_BYTES:
-                raise ValueError("download exceeded the size limit")
-            out.write(chunk)
-    return written
-
-
-def _version_tuple(text: str) -> tuple:
-    return tuple(int(part) for part in re.findall(r"\d+", text))
 
 _current_game_id: str = ""
 _current_ac_online: bool = False
@@ -209,7 +114,7 @@ def _get_ac_online() -> bool:
     return status not in ("", "Discharging", "Unknown")
 
 
-def _pick_profile_values(p: dict, ac_online: bool) -> tuple:
+def _pick_profile_values(p: dict, ac_online: bool) -> tuple[int, int, int]:
     if ac_online and p.get("ac_separate") and p.get("ac_spl") is not None:
         return (
             p["ac_spl"],
@@ -223,24 +128,46 @@ def _pick_profile_values(p: dict, ac_online: bool) -> tuple:
     )
 
 
-# ── JSON persistence ───────────────────────────────────────────────────────────
+# ── Persistence ────────────────────────────────────────────────────────────────
 
-def _load_json(path: str, default: dict) -> dict:
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return dict(default)
+# Settings live in Decky's settings directory, not in the plugin directory. The
+# plugin directory is wiped by every reinstall, and this plugin's own updater
+# tells the user to uninstall before installing the new zip - which used to take
+# the global settings and every per-game profile with it.
+settings = SettingsManager(
+    name="settings",
+    settings_directory=decky.DECKY_PLUGIN_SETTINGS_DIR,
+)
+
+SETTINGS_KEY_SETTINGS      = "settings"
+SETTINGS_KEY_GAME_PROFILES = "game_profiles"
+SETTINGS_KEY_SCHEMA        = "schema_version"
+CURRENT_SCHEMA             = 2
+
+# Pre-schema-2 locations, inside the plugin directory. Read once by _migrate()
+# and never written again.
+LEGACY_SETTINGS_FILE = os.path.join(PLUGIN_DIR, "settings.json")
+LEGACY_PROFILES_FILE = os.path.join(PLUGIN_DIR, "profiles.json")
+
+# The enforce loop reads settings from an executor thread while RPC handlers
+# write them from the event loop. Re-entrant because the write paths load first.
+_settings_lock = threading.RLock()
 
 
-def _save_json(path: str, data: dict) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+def _read_key(key: str, default: dict) -> dict:
+    with _settings_lock:
+        settings.read()
+        value = settings.getSetting(key, None)
+    return value if isinstance(value, dict) else dict(default)
 
 
-def _clamp_triplet(spl, sppt, fppt) -> tuple:
+def _write_key(key: str, value: dict) -> None:
+    with _settings_lock:
+        settings.setSetting(key, value)
+        settings.commit()
+
+
+def _clamp_triplet(spl, sppt, fppt) -> tuple[int, int, int]:
     """Enforce 5 W <= spl <= sppt <= fppt <= 50 W (milliwatts).
 
     SPPT/FPPT are offsets above SPL in the UI, so they can never sit below it.
@@ -256,7 +183,7 @@ def _clamp_triplet(spl, sppt, fppt) -> tuple:
 
 
 def _load_settings() -> dict:
-    s = _load_json(SETTINGS_FILE, DEFAULT_SETTINGS)
+    s = _read_key(SETTINGS_KEY_SETTINGS, DEFAULT_SETTINGS)
     s["spl"], s["sppt"], s["fppt"] = _clamp_triplet(
         s.get("spl",  DEFAULT_SETTINGS["spl"]),
         s.get("sppt", DEFAULT_SETTINGS["sppt"]),
@@ -272,13 +199,13 @@ def _load_settings() -> dict:
 
 
 def _save_settings(s: dict) -> None:
-    _save_json(SETTINGS_FILE, s)
+    _write_key(SETTINGS_KEY_SETTINGS, s)
 
 
 # ── Per-game profiles ──────────────────────────────────────────────────────────
 
 def _load_profiles() -> dict:
-    profiles = _load_json(PROFILES_FILE, {})
+    profiles = _read_key(SETTINGS_KEY_GAME_PROFILES, {})
     for p in profiles.values():
         if not isinstance(p, dict):
             continue
@@ -292,7 +219,7 @@ def _load_profiles() -> dict:
 
 
 def _save_profiles(profiles: dict) -> None:
-    _save_json(PROFILES_FILE, profiles)
+    _write_key(SETTINGS_KEY_GAME_PROFILES, profiles)
 
 
 def _save_active(s: dict, spl: int, sppt: int, fppt: int) -> None:
@@ -300,6 +227,48 @@ def _save_active(s: dict, spl: int, sppt: int, fppt: int) -> None:
     s["active_sppt"] = sppt
     s["active_fppt"] = fppt
     _save_settings(s)
+
+
+def _read_legacy(path: str) -> dict:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _migrate() -> None:
+    """Fold the pre-1.5.0 files in the plugin directory into Decky's store.
+
+    Runs exactly once. The old files are left on disk untouched: they disappear
+    with the next reinstall anyway, and leaving them means a downgrade still
+    finds its settings.
+    """
+    with _settings_lock:
+        settings.read()
+        try:
+            schema = int(settings.getSetting(SETTINGS_KEY_SCHEMA, 1))
+        except (TypeError, ValueError):
+            schema = 1
+        if schema >= CURRENT_SCHEMA:
+            return
+
+        legacy_settings = _read_legacy(LEGACY_SETTINGS_FILE)
+        legacy_profiles = _read_legacy(LEGACY_PROFILES_FILE)
+
+        if legacy_settings and settings.getSetting(SETTINGS_KEY_SETTINGS, None) is None:
+            settings.setSetting(SETTINGS_KEY_SETTINGS, legacy_settings)
+            decky.logger.info(
+                f"[legotdp] migrated {LEGACY_SETTINGS_FILE} into the Decky settings store")
+        if legacy_profiles and settings.getSetting(SETTINGS_KEY_GAME_PROFILES, None) is None:
+            settings.setSetting(SETTINGS_KEY_GAME_PROFILES, legacy_profiles)
+            decky.logger.info(
+                f"[legotdp] migrated {len(legacy_profiles)} per-game profile(s) "
+                f"from {LEGACY_PROFILES_FILE}")
+
+        settings.setSetting(SETTINGS_KEY_SCHEMA, CURRENT_SCHEMA)
+        settings.commit()
 
 
 # ── ryzenadj binary ────────────────────────────────────────────────────────────
@@ -311,7 +280,7 @@ def _download_ryzenadj() -> None:
     os.close(tmp_fd)
     try:
         with open(tmp_path, "wb") as out:
-            _download_to(RYZENADJ_URL, out, timeout=30)
+            updater.download_to(RYZENADJ_URL, out, timeout=30)
         with tarfile.open(tmp_path, "r:gz") as tar:
             member = next(
                 (m for m in tar.getmembers()
@@ -344,7 +313,7 @@ def _ensure_ryzenadj() -> None:
 
 # ── ryzenadj helpers ───────────────────────────────────────────────────────────
 
-def _run_ryzenadj(args: list, timeout: float = 5.0) -> tuple:
+def _run_ryzenadj(args: list, timeout: float = 5.0) -> tuple[int, str, str]:
     """Run ryzenadj, return (returncode, stdout, stderr).
     Uses Popen so kill() after timeout never calls communicate() and blocks."""
     if not os.path.isfile(BIN_PATH):
@@ -412,7 +381,7 @@ def _wmi_path(key: str, leaf: str) -> str:
     return os.path.join(WMI_ROOT, WMI_ATTRS[key], leaf)
 
 
-def _wmi_read(key: str, leaf: str) -> Optional[int]:
+def _wmi_read(key: str, leaf: str) -> int | None:
     try:
         with open(_wmi_path(key, leaf)) as f:
             return int(f.read().strip())
@@ -431,7 +400,7 @@ def _wmi_caps() -> dict:
     return caps
 
 
-def _profile_path() -> Optional[str]:
+def _profile_path() -> str | None:
     """The platform-profile node whose choices include 'custom' (the tunable one)."""
     for path in glob.glob(PLATFORM_PROFILE_GLOB):
         try:
@@ -519,11 +488,11 @@ def _apply_wmi(spl_w: int, sppt_w: int, fppt_w: int) -> dict:
 
 # ── RAPL package power ─────────────────────────────────────────────────────────
 
-_rapl_dir: Optional[str] = None
+_rapl_dir: str | None = None
 _rapl_last: tuple = ()
 
 
-def _find_rapl_package() -> Optional[str]:
+def _find_rapl_package() -> str | None:
     global _rapl_dir
     if _rapl_dir is None:
         _rapl_dir = ""
@@ -538,7 +507,7 @@ def _find_rapl_package() -> Optional[str]:
     return _rapl_dir or None
 
 
-def _rapl_watts() -> Optional[float]:
+def _rapl_watts() -> float | None:
     """Average package draw since the previous call, in watts."""
     global _rapl_last
     d = _find_rapl_package()
@@ -828,28 +797,20 @@ def _enforce_target(want: tuple) -> None:
             f"[legotdp] drift re-apply failed rc={result['returncode']} err={result['stderr']}")
 
 
-def _xdg_download_dir(home_dir: str) -> str:
-    try:
-        with open(os.path.join(home_dir, ".config", "user-dirs.dirs")) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("XDG_DOWNLOAD_DIR="):
-                    value = line.split("=", 1)[1].strip('"')
-                    return value.replace("$HOME", home_dir)
-    except OSError:
-        pass
-    return os.path.join(home_dir, "Downloads")
-
-
 # ── Plugin class ───────────────────────────────────────────────────────────────
 
 class Plugin:
     _ready: bool = False
-    _setup_error: Optional[str] = None
+    # Surfaced through is_ready() so a failed start shows up in the panel
+    # instead of leaving the user with sliders that silently do nothing.
+    _setup_error: str | None = None
     _tasks: list = []
 
     async def is_ready(self) -> dict:
-        return {"ready": self._ready, "error": self._setup_error}
+        return {"ready": self._ready, "error": self._setup_error or ""}
+
+    async def get_version(self) -> dict:
+        return {"version": updater.plugin_version()}
 
     async def get_settings(self) -> dict:
         return _load_settings()
@@ -971,7 +932,7 @@ class Plugin:
         global _panel_active
         _panel_active = active
 
-    async def set_running_game(self, app_id: str) -> None:
+    async def set_active_app(self, app_id: str) -> None:
         """Frontend reports the authoritative running-game appid (or '' for none)."""
         global _frontend_appid, _frontend_appid_ts
         _frontend_appid = app_id or ""
@@ -988,7 +949,7 @@ class Plugin:
             return {"success": False, "stderr": "not ready", "stdout": "", "returncode": -1}
 
         loop = asyncio.get_running_loop()
-        profiles: Optional[dict] = None
+        profiles: dict | None = None
         existing: dict = {}
         apply_spl, apply_sppt, apply_fppt = spl, sppt, fppt
 
@@ -1020,77 +981,14 @@ class Plugin:
 
         return result
 
-    async def check_update(self) -> dict:
-        def _do() -> dict:
-            try:
-                with _open_url(GITHUB_API_URL, timeout=10, headers={
-                    "Accept": "application/vnd.github.v3+json", "User-Agent": "LeGoTDP"}) as resp:
-                    data = json.loads(resp.read(_MAX_DOWNLOAD_BYTES))
-                tag = data.get("tag_name", "")
-                if not tag:
-                    raise ValueError("GitHub API response missing tag_name")
-                latest_ver = tag.lstrip("v").split("-")[0]
-                with open(os.path.join(PLUGIN_DIR, "plugin.json")) as f:
-                    current_ver = json.load(f).get("version", "0.0.0").split("-")[0]
-                latest_t, current_t = _version_tuple(latest_ver), _version_tuple(current_ver)
-                # A tag that is not purely numeric leaves one tuple empty; fall back to
-                # a string comparison rather than raising.
-                if latest_t and current_t:
-                    available = latest_t > current_t
-                else:
-                    available = latest_ver != current_ver
-                asset = next((a for a in data.get("assets", []) if a.get("name", "").endswith(".zip")), None)
-                return {
-                    "current_version":  current_ver,
-                    "latest_version":   latest_ver,
-                    "update_available": available,
-                    "download_url":     asset.get("browser_download_url") if asset else None,
-                    "asset_name":       asset.get("name") if asset else None,
-                }
-            except Exception as e:
-                decky.logger.error(f"[legotdp] check_update: {e}")
-                return {"error": str(e)}
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _do)
+    # ---- Updates ----------------------------------------------------- #
+
+    async def check_for_updates(self) -> dict:
+        return await asyncio.get_running_loop().run_in_executor(None, updater.check)
 
     async def perform_update(self, download_url: str, asset_name: str) -> dict:
-        def _do() -> dict:
-            dest = None
-            try:
-                user = next(
-                    (p for p in sorted(pwd.getpwall(), key=lambda p: p.pw_uid)
-                     if p.pw_uid >= 1000 and os.path.isdir(p.pw_dir)),
-                    None,
-                )
-                downloads_dir = _xdg_download_dir(user.pw_dir) if user else "/home/deck/Downloads"
-                created_dir = not os.path.isdir(downloads_dir)
-                os.makedirs(downloads_dir, exist_ok=True)
-                # Plugin runs as root - hand ownership back so the user can manage the file
-                if user and created_dir:
-                    os.chown(downloads_dir, user.pw_uid, user.pw_gid)
-                dest = os.path.join(downloads_dir, os.path.basename(asset_name))
-                try:
-                    os.unlink(dest)
-                except FileNotFoundError:
-                    pass
-                with open(dest, "wb") as f:
-                    written = _download_to(download_url, f, timeout=60)
-                if user:
-                    os.chown(dest, user.pw_uid, user.pw_gid)
-                os.chmod(dest, 0o644)
-                decky.logger.info(f"[legotdp] update downloaded to {dest} ({written} bytes)")
-                return {"success": True, "path": dest}
-            except Exception as e:
-                decky.logger.error(f"[legotdp] perform_update: {e}")
-                # Never leave a truncated or oversized file behind.
-                if dest:
-                    try:
-                        os.unlink(dest)
-                    except OSError:
-                        pass
-                return {"success": False, "error": str(e)}
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _do)
+        return await asyncio.get_running_loop().run_in_executor(
+            None, updater.download, download_url, asset_name)
 
     async def _info_loop(self):
         loop = asyncio.get_running_loop()
@@ -1112,13 +1010,16 @@ class Plugin:
                 decky.logger.warning(f"[legotdp] enforce iteration failed: {e}")
 
     async def _main(self):
-        decky.logger.info("[legotdp] initialising")
+        decky.logger.info(f"[legotdp] startup  v{updater.plugin_version()}")
         try:
             global _current_ac_online
             loop = asyncio.get_running_loop()
+            # Before anything reads settings: lifts the pre-1.5.0 files out of the
+            # plugin directory, which the next reinstall would have deleted.
+            await loop.run_in_executor(None, _migrate)
             # Resolve the trust store now so the log states up front whether downloads
             # and update checks will be able to verify certificates.
-            await loop.run_in_executor(None, _ssl_context)
+            await loop.run_in_executor(None, updater.ssl_context)
             # Seed this so the first enforce pass does not report a phantom AC change.
             _current_ac_online = await loop.run_in_executor(None, _get_ac_online)
             wmi = await loop.run_in_executor(None, _wmi_caps)
@@ -1153,3 +1054,21 @@ class Plugin:
         for t in self._tasks:
             t.cancel()
         decky.logger.info("[legotdp] unloaded")
+
+    # Decky calls these around system sleep on loader versions that support them.
+    # The enforce loop would notice the drift within five seconds anyway; doing it
+    # here means the limits are back before the first frame is drawn.
+    async def _suspend(self):
+        decky.logger.info("[legotdp] suspending")
+
+    async def _resume(self):
+        decky.logger.info("[legotdp] resumed, re-applying limits")
+        s = _load_settings()
+        if not s.get("enabled", True):
+            return
+        want = _clamp_triplet(
+            s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
+            s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
+            s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+        )
+        await asyncio.get_running_loop().run_in_executor(None, _apply_limits, *want)

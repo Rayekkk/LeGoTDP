@@ -1,4 +1,4 @@
-import { definePlugin, callable } from "@decky/api";
+import { callable, definePlugin, toaster, useQuickAccessVisible } from "@decky/api";
 import {
   ButtonItem,
   Field,
@@ -7,10 +7,10 @@ import {
   Router,
   SliderField,
   Spinner,
-  ToggleField,
   staticClasses,
+  ToggleField,
 } from "@decky/ui";
-import { FC, useEffect, useRef, useState } from "react";
+import { FC, useCallback, useEffect, useRef, useState } from "react";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const toMw  = (w: number)  => w * 1000;
@@ -119,9 +119,7 @@ const exceedsCaps = (spl: number, sppt: number, fppt: number, caps: Caps) =>
   spl > caps.spl || sppt > caps.sppt || fppt > caps.fppt;
 
 function statusStyle(msg: string) {
-  return msg.startsWith("Error")
-    ? { ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" }
-    : { fontSize: "12px", color: "#4ade80" };
+  return msg.startsWith("Error") ? styles.errorBox : { fontSize: "12px", color: OK_COLOR };
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -143,7 +141,7 @@ interface GameProfile {
 }
 interface CapsInfo   { min: number; std: Caps; max: Caps; wmi: boolean }
 interface RunningGame { appId: string; name: string }
-interface ReadyState  { ready: boolean; error: string | null }
+interface ReadyState  { ready: boolean; error: string }
 interface UpdateInfo {
   current_version?: string;
   latest_version?: string;
@@ -155,6 +153,7 @@ interface UpdateInfo {
 
 // ── Backend callables ──────────────────────────────────────────────────────────
 const isReady           = callable<[], ReadyState>("is_ready");
+const getVersion        = callable<[], { version: string }>("get_version");
 const getSettings       = callable<[], Settings>("get_settings");
 const getCaps           = callable<[], CapsInfo>("get_caps");
 const applyTdp          = callable<[number, number, number, string, string], TdpResult>("apply_tdp");
@@ -164,41 +163,181 @@ const deleteGameProfile = callable<[string], void>("delete_game_profile");
 const setPluginEnabled  = callable<[boolean], void>("set_plugin_enabled");
 const restoreDefaults   = callable<[], TdpResult>("restore_defaults");
 const setPanelActive    = callable<[boolean], void>("set_panel_active");
-const setRunningGame    = callable<[string], void>("set_running_game");
-const checkUpdate      = callable<[], UpdateInfo>("check_update");
-const performUpdate    = callable<[string, string], { success: boolean; path?: string; error?: string }>("perform_update");
-const getPowerSource       = callable<[], { ac: boolean }>("get_power_source");
-const setGameAcProfile     = callable<[string, number, number, number, boolean, string], { success: boolean; stderr?: string }>("set_game_ac_profile");
-const getExtrasUnlocked    = callable<[], boolean>("get_extras_unlocked");
+const setActiveApp      = callable<[string], void>("set_active_app");
+const getPowerSource    = callable<[], { ac: boolean }>("get_power_source");
+const setGameAcProfile  = callable<[string, number, number, number, boolean, string], { success: boolean; stderr?: string }>("set_game_ac_profile");
+const getExtrasUnlocked = callable<[], boolean>("get_extras_unlocked");
 const setExtrasUnlockedCall = callable<[boolean], void>("set_extras_unlocked");
+const checkForUpdates   = callable<[], UpdateInfo>("check_for_updates");
+const performUpdate     = callable<[string, string], { success: boolean; path?: string; error?: string }>("perform_update");
 
-// ── Shared styles ──────────────────────────────────────────────────────────────
+// ── Toasts ─────────────────────────────────────────────────────────────────────
+
+const notify = (title: string, body: string) => {
+  try {
+    toaster.toast({ title, body, duration: 4000 });
+  } catch {
+    console.error(`[legotdp] ${title}: ${body}`);
+  }
+};
+
+const notifyFailure = (title: string, err: unknown) => {
+  const body = err instanceof Error ? err.message : String(err ?? "Unknown error");
+  console.error(`[legotdp] ${title}`, err);
+  notify(title, body);
+};
+
+// ── Styles - Steam theme variables with hardcoded fallbacks ────────────────────
+
+const OK_COLOR = "var(--gpColor-Green, #4ade80)";
+const BAD_COLOR = "var(--gpColor-Red, #f87171)";
+const WARN_COLOR = "var(--gpColor-Yellow, #fbbf24)";
+const DIM_COLOR = "var(--gpColor-TextMuted, rgba(255,255,255,0.5))";
+
 const styles = {
   valueTag: {
-    fontSize: "13px", fontWeight: "bold", color: "#fff",
-    background: "rgba(255,255,255,0.1)", borderRadius: "4px",
-    padding: "1px 6px", fontFamily: "monospace",
+    fontSize: "13px",
+    fontWeight: "bold",
+    color: "var(--gpColor-White, #fff)",
+    background: "rgba(255,255,255,0.1)",
+    borderRadius: "4px",
+    padding: "1px 6px",
+    fontFamily: "monospace",
   },
   profileTag: {
-    fontSize: "11px", fontWeight: "bold", color: "#fff",
-    background: "rgba(74,222,128,0.25)", border: "1px solid rgba(74,222,128,0.5)",
-    borderRadius: "3px", padding: "0px 5px", fontFamily: "monospace",
+    fontSize: "11px",
+    fontWeight: "bold",
+    color: "var(--gpColor-White, #fff)",
+    background: "rgba(74,222,128,0.25)",
+    border: "1px solid rgba(74,222,128,0.5)",
+    borderRadius: "3px",
+    padding: "0px 5px",
+    fontFamily: "monospace",
   },
-  warningBox: {
-    background: "rgba(251,191,36,0.15)", border: "1px solid rgba(251,191,36,0.4)",
-    borderRadius: "6px", padding: "8px 10px", fontSize: "11px",
-    color: "rgba(251,191,36,0.9)", lineHeight: "1.5", marginTop: "4px",
+  infoBox: {
+    background: "rgba(251,191,36,0.15)",
+    border: "1px solid rgba(251,191,36,0.4)",
+    borderRadius: "6px",
+    padding: "8px 10px",
+    fontSize: "11px",
+    color: WARN_COLOR,
+    lineHeight: "1.5",
+    marginTop: "4px",
+  },
+  errorBox: {
+    background: "rgba(248,113,113,0.1)",
+    border: "1px solid rgba(248,113,113,0.4)",
+    borderRadius: "6px",
+    padding: "8px 10px",
+    fontSize: "11px",
+    color: BAD_COLOR,
+    lineHeight: "1.5",
+    marginTop: "4px",
   },
 };
 
-// ── Steam game detection ───────────────────────────────────────────────────────
-const detectRunningGame = (): RunningGame | null => {
-  const app = (Router as any)?.MainRunningApp;
-  if (app?.appid) {
-    return { appId: String(app.appid), name: app.display_name ?? String(app.appid) };
+// ── Running app watcher ────────────────────────────────────────────────────────
+
+type GameListener = (game: RunningGame | null) => void;
+
+/**
+ * Tracks the foreground game and tells the backend about it, so the backend's
+ * enforce loop applies the right per-game profile even for titles its
+ * /proc scan cannot see through pressure-vessel/gamescope.
+ *
+ * Started at plugin load rather than from the panel: the enforce loop runs
+ * whether or not the Quick Access Menu is open, and it is exactly the
+ * closed-panel case where the /proc fallback used to guess wrong.
+ *
+ * Unlike LeGo-Vibe-Control's copy, this pushes on every tick instead of only
+ * on a change. The backend trusts a frontend-reported appid for 12 seconds and
+ * falls back to the /proc scan once it goes stale, so the value has to be kept
+ * fresh, not merely correct at the moment it last changed.
+ */
+class AppWatcher {
+  private static listeners: GameListener[] = [];
+  private static current: RunningGame | null = null;
+  private static timer: ReturnType<typeof setInterval> | undefined;
+  private static unsubs: Array<() => void> = [];
+  private static started = false;
+  private static busy = false;
+
+  static activeGame(): RunningGame | null {
+    try {
+      const app = (Router as any)?.MainRunningApp;
+      if (!app?.appid) return null;
+      return { appId: String(app.appid), name: app.display_name ?? String(app.appid) };
+    } catch {
+      return null;
+    }
   }
-  return null;
-};
+
+  static currentGame(): RunningGame | null {
+    return this.current;
+  }
+
+  static listen(fn: GameListener): () => void {
+    this.listeners.push(fn);
+    return () => {
+      this.listeners = this.listeners.filter((f) => f !== fn);
+    };
+  }
+
+  static start() {
+    if (this.started) return;
+    this.started = true;
+    this.current = this.activeGame();
+
+    const steam = (window as any).SteamClient;
+
+    try {
+      const reg = steam?.GameSessions?.RegisterForAppLifetimeNotifications?.(() => {
+        // Router.MainRunningApp lags the notification slightly.
+        setTimeout(() => void this.check(), 300);
+      });
+      if (reg?.unregister) this.unsubs.push(() => reg.unregister());
+    } catch (e) {
+      console.warn("[legotdp] app lifetime notifications unavailable", e);
+    }
+
+    this.timer = setInterval(() => void this.check(), 2000);
+    void this.check();
+  }
+
+  static stop() {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    for (const off of this.unsubs) {
+      try {
+        off();
+      } catch {
+        /* the subscription may already be gone */
+      }
+    }
+    this.unsubs = [];
+    this.listeners = [];
+    this.current = null;
+    this.started = false;
+  }
+
+  private static async check() {
+    if (this.busy) return;
+    const game = this.activeGame();
+    const changed = game?.appId !== this.current?.appId;
+    this.current = game;
+    this.busy = true;
+    try {
+      await setActiveApp(game?.appId ?? "");
+    } catch (e) {
+      console.error("[legotdp] setActiveApp failed", e);
+    } finally {
+      this.busy = false;
+    }
+    if (changed) this.listeners.forEach((fn) => fn(game));
+  }
+}
 
 // ── Icon ───────────────────────────────────────────────────────────────────────
 const ChipIcon: FC = () => (
@@ -211,8 +350,13 @@ const ChipIcon: FC = () => (
 // ── Live TDP panel ─────────────────────────────────────────────────────────────
 const LivePanel: FC = () => {
   const [info, setInfo] = useState<TdpInfo | null>(null);
+  const visible = useQuickAccessVisible();
 
+  // Gated on visibility, not just on mount: the panel stays mounted while the
+  // Quick Access Menu is on another tab, and refreshing it there costs a RAPL
+  // read and an RPC round trip every two seconds for nobody to look at.
   useEffect(() => {
+    if (!visible) return;
     let active = true;
     setPanelActive(true);
     const refresh = async () => {
@@ -225,7 +369,7 @@ const LivePanel: FC = () => {
       clearInterval(id);
       setPanelActive(false);
     };
-  }, []);
+  }, [visible]);
 
   const v = info?.values ?? {};
   return (
@@ -261,76 +405,100 @@ const LivePanel: FC = () => {
 
 // ── Update section ─────────────────────────────────────────────────────────────
 const UpdateSection: FC = () => {
-  const [checking,    setChecking]    = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const [zipPath,     setZipPath]     = useState<string | null>(null);
-  const [info,        setInfo]        = useState<UpdateInfo | null>(null);
+  const [updateInfo,   setUpdateInfo]   = useState<UpdateInfo | null>(null);
+  const [checking,     setChecking]     = useState(false);
+  const [downloading,  setDownloading]  = useState(false);
+  const [downloadPath, setDownloadPath] = useState<string | null>(null);
+  const [version,      setVersion]      = useState("");
 
-  const handleCheck = async () => {
+  // Read straight from the manifest so the installed version is on screen
+  // before anyone presses the button, rather than only after a network call.
+  useEffect(() => {
+    let active = true;
+    getVersion()
+      .then((v) => { if (active) setVersion(v.version ?? ""); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  const handleCheckUpdate = useCallback(async () => {
     setChecking(true);
-    setInfo(null);
-    setZipPath(null);
-    try { setInfo(await checkUpdate()); }
-    catch (e: unknown) { setInfo({ error: String(e) }); }
-    setChecking(false);
-  };
+    setUpdateInfo(null);
+    setDownloadPath(null);
+    try {
+      setUpdateInfo(await checkForUpdates());
+    } catch (e) {
+      notifyFailure("Update check failed", e);
+      setUpdateInfo({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setChecking(false);
+    }
+  }, []);
 
-  const handleDownload = async () => {
-    if (!info?.download_url || !info?.asset_name) return;
+  const handleDownloadUpdate = useCallback(async () => {
+    if (!updateInfo?.download_url || !updateInfo?.asset_name) return;
     setDownloading(true);
     try {
-      const r = await performUpdate(info.download_url, info.asset_name);
-      if (r.success && r.path) {
-        setZipPath(r.path);
-      } else {
-        setInfo(prev => ({ ...(prev ?? {}), error: r.error ?? "Download failed" }));
+      const res = await performUpdate(updateInfo.download_url, updateInfo.asset_name);
+      if (res.success && res.path) setDownloadPath(res.path);
+      else {
+        setUpdateInfo({ ...updateInfo, error: res.error });
+        notify("Download failed", res.error ?? "Unknown error");
       }
-    } catch (e: unknown) {
-      setInfo({ error: String(e) });
+    } catch (e) {
+      notifyFailure("Download failed", e);
+    } finally {
+      setDownloading(false);
     }
-    setDownloading(false);
-  };
+  }, [updateInfo]);
 
   return (
     <PanelSection title="Updates">
       <PanelSectionRow>
-        <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.6)" }}>
-          Installed: <span style={styles.valueTag}>{info?.current_version ? `v${info.current_version}` : "—"}</span>
-          {!info?.error && info?.latest_version && (
-            <span> &nbsp; Latest: <span style={styles.valueTag}>v{info.latest_version}</span></span>
+        <div style={{ fontSize: "12px", color: DIM_COLOR }}>
+          Installed:{" "}
+          <span style={styles.valueTag}>v{updateInfo?.current_version ?? version ?? "?"}</span>
+          {updateInfo?.latest_version && !updateInfo.error && (
+            <span>
+              {" "}
+              Latest: <span style={styles.valueTag}>v{updateInfo.latest_version}</span>
+            </span>
           )}
         </div>
       </PanelSectionRow>
-      {info?.error && (
+      {updateInfo?.error && (
         <PanelSectionRow>
-          <div style={{ ...styles.warningBox, color: "#f87171", borderColor: "rgba(248,113,113,0.4)", background: "rgba(248,113,113,0.1)" }}>
-            {info.error}
-          </div>
+          <div style={styles.errorBox}>{updateInfo.error}</div>
         </PanelSectionRow>
       )}
-      {info && !info.error && !info.update_available && !zipPath && (
+      {updateInfo && !updateInfo.error && !updateInfo.update_available && !downloadPath && (
         <PanelSectionRow>
-          <div style={{ fontSize: "12px", color: "#4ade80" }}>Up to date</div>
+          <div style={{ fontSize: "12px", color: OK_COLOR }}>Up to date</div>
         </PanelSectionRow>
       )}
-      {info?.update_available && !zipPath && (
+      {updateInfo?.update_available && !downloadPath && (
         <PanelSectionRow>
-          <ButtonItem layout="below" onClick={handleDownload} disabled={downloading}>
-            {downloading ? "Downloading..." : `Download v${info.latest_version ?? "?"}`}
+          <ButtonItem layout="below" onClick={handleDownloadUpdate} disabled={downloading}>
+            {downloading ? "Downloading..." : `Download v${updateInfo.latest_version}`}
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {zipPath && (
+      {downloadPath && (
         <PanelSectionRow>
-          <div style={styles.warningBox}>
-            Downloaded to <span style={{ fontFamily: "monospace", wordBreak: "break-all" }}>{zipPath}</span>
-            <br /><br />
-            To install: Decky → Developer → Uninstall LeGoTDP → Install Plugin from ZIP → select the file.
+          <div style={styles.infoBox}>
+            Downloaded to{" "}
+            <span style={{ fontFamily: "monospace", wordBreak: "break-all" }}>
+              {downloadPath}
+            </span>
+            <br />
+            <br />
+            To install: Decky - Developer - Uninstall LeGoTDP - Install Plugin from ZIP -
+            select the file. Your settings and per-game profiles are kept.
           </div>
         </PanelSectionRow>
       )}
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={handleCheck} disabled={checking || downloading}>
+        <ButtonItem layout="below" onClick={handleCheckUpdate} disabled={checking || downloading}>
           {checking ? "Checking..." : "Check for updates"}
         </ButtonItem>
       </PanelSectionRow>
@@ -368,6 +536,8 @@ const Content: FC = () => {
   const [status,   setStatus]   = useState<string | null>(null);
   const [loading,  setLoading]  = useState(false);
 
+  const visible = useQuickAccessVisible();
+
   const autoAppliedRef = useRef<string | null>(null);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -383,6 +553,13 @@ const Content: FC = () => {
     if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
     setStatus(msg);
     if (msg) statusTimerRef.current = setTimeout(() => setStatus(null), 3000);
+  };
+
+  /** Inline status plus a toast: the inline line clears after three seconds and
+   *  lives in a section the user may not be looking at. */
+  const showError = (title: string, e: unknown) => {
+    notifyFailure(title, e);
+    showStatus(`Error: ${e instanceof Error ? e.message : String(e)}`);
   };
 
   const applyGameProfile = async (gp: GameProfile, appId: string, statusMsg: string) => {
@@ -406,7 +583,7 @@ const Content: FC = () => {
     try {
       await applyTdp(p.spl, p.sppt, p.fppt, appId, "");
     } catch (e: unknown) {
-      showStatus(`Error applying TDP: ${String(e)}`);
+      showError("Could not apply TDP", e);
       return;
     }
     showStatus(statusMsg);
@@ -443,21 +620,31 @@ const Content: FC = () => {
     return () => { active = false; };
   }, []);
 
-  // ── Game detection + AC polling ───────────────────────────────────────────────
+  // ── Game detection ────────────────────────────────────────────────────────────
+  // AppWatcher owns this and runs for the whole session, so the backend keeps
+  // getting the authoritative appid while the panel is closed. Here we only
+  // adopt what it reports.
   useEffect(() => {
-    if (!ready) return;
+    setGame(AppWatcher.currentGame());
+    return AppWatcher.listen(setGame);
+  }, []);
+
+  // ── AC polling ────────────────────────────────────────────────────────────────
+  // Only while the panel is on screen. The backend's own enforce loop reacts to
+  // an AC change on its own; this poll exists purely to keep the label honest.
+  useEffect(() => {
+    if (!ready || !visible) return;
+    let active = true;
     const poll = async () => {
-      const g = detectRunningGame();
-      setGame(g);
-      // Feed the backend the authoritative appid so its enforce loop applies the
-      // right per-game / AC profile even for games its /proc scan cannot see.
-      try { await setRunningGame(g?.appId ?? ""); } catch (_) {}
-      try { const ps = await getPowerSource(); setAcOnline(ps.ac); } catch (_) {}
+      try {
+        const ps = await getPowerSource();
+        if (active) setAcOnline(ps.ac);
+      } catch (_) {}
     };
     poll();
     const id = setInterval(poll, 3000);
-    return () => clearInterval(id);
-  }, [ready]);
+    return () => { active = false; clearInterval(id); };
+  }, [ready, visible]);
 
   // ── Auto-apply game profile when game / ready / enabled changes ──────────────
   useEffect(() => {
@@ -489,7 +676,7 @@ const Content: FC = () => {
             showStatus("Global settings restored.");
           }
         } catch (e: unknown) {
-          showStatus(`Error: ${String(e)}`);
+          showError("LeGoTDP", e);
         }
       })();
       return;
@@ -504,7 +691,7 @@ const Content: FC = () => {
         await applyGameProfile(gp, game.appId, `Auto-applied profile for ${game.name}.`);
       } catch (e: unknown) {
         autoAppliedRef.current = null;
-        showStatus(`Error: ${String(e)}`);
+        showError("LeGoTDP", e);
       }
     })();
   }, [game?.appId, ready, enabled, perGame]);
@@ -551,7 +738,7 @@ const Content: FC = () => {
     } catch (e: unknown) {
       setPreset(prevPreset);
       if (editingAc) setAcTuning(prevAcTuning); else setTuning(prevTuning);
-      showStatus(`Error: ${String(e)}`);
+      showError("LeGoTDP", e);
     }
     setLoading(false);
   };
@@ -583,7 +770,7 @@ const Content: FC = () => {
           setAcSeparate(prevAcSeparate); setEditingAc(prevEditingAc);
           setSavedPreset(prevSavedPreset); setSavedAcPreset(prevSavedAcPreset);
         }
-        showStatus(`Error: ${String(e)}`);
+        showError("LeGoTDP", e);
       }
       // Cleared last so the auto-apply effect cannot race the delete above.
       autoAppliedRef.current = profileDeleted ? game.appId : null;
@@ -600,7 +787,7 @@ const Content: FC = () => {
         }
       } catch (e: unknown) {
         setPerGame(false);
-        showStatus(`Error: ${String(e)}`);
+        showError("LeGoTDP", e);
       }
     }
   };
@@ -621,7 +808,7 @@ const Content: FC = () => {
       }
     } catch (e: unknown) {
       setEnabled(!checked);
-      showStatus(`Error: ${String(e)}`);
+      showError("LeGoTDP", e);
     }
   };
 
@@ -649,7 +836,7 @@ const Content: FC = () => {
       setSavedAcPreset(prevSavedAcPreset);
       setEditingAc(prevEditingAc);
       setAcTuning(prevAcTuning);
-      showStatus(`Error: ${String(e)}`);
+      showError("LeGoTDP", e);
     }
   };
 
@@ -660,7 +847,7 @@ const Content: FC = () => {
       await setExtrasUnlockedCall(checked);
     } catch (e: unknown) {
       setExtrasUnlocked(!checked);
-      showStatus(`Error: ${String(e)}`);
+      showError("LeGoTDP", e);
       return;
     }
     if (checked) return;
@@ -689,7 +876,7 @@ const Content: FC = () => {
         if (r.success) setSavedAcPreset("custom");
       }
     } catch (e: unknown) {
-      showStatus(`Error: ${String(e)}`);
+      showError("LeGoTDP", e);
     }
   };
 
@@ -716,7 +903,7 @@ const Content: FC = () => {
         );
       }
     } catch (e: unknown) {
-      showStatus(`Error: ${String(e)}`);
+      showError("LeGoTDP", e);
     }
     setLoading(false);
   };
@@ -743,10 +930,10 @@ const Content: FC = () => {
             description={
               enabled ? (
                 <span>
-                  <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.5)" }}>Global Profile: </span>
+                  <span style={{ fontSize: "11px", color: DIM_COLOR }}>Global Profile: </span>
                   <span style={styles.profileTag}>{profileLabel(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, globalProfile.preset)}</span>
                   {!extrasUnlocked && exceedsCaps(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, stdCaps) && (
-                    <span style={{ fontSize: "11px", color: "rgba(251,191,36,0.9)" }}> ⚠ exceeds firmware limits</span>
+                    <span style={{ fontSize: "11px", color: WARN_COLOR }}> ⚠ exceeds firmware limits</span>
                   )}
                 </span>
               ) : "Using system defaults"
@@ -776,14 +963,14 @@ const Content: FC = () => {
                       <span>{game.name}</span>
                       <span style={{ display: "flex", flexDirection: "column", gap: "1px" }}>
                         <span>
-                          <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.5)" }}>Battery: </span>
+                          <span style={{ fontSize: "11px", color: DIM_COLOR }}>Battery: </span>
                           <span style={styles.profileTag}>
                             {profileLabel(absolute(tuning).spl, absolute(tuning).sppt, absolute(tuning).fppt, savedPreset)}
                           </span>
                         </span>
                         {acSeparate && (
                           <span>
-                            <span style={{ fontSize: "11px", color: "rgba(255,255,255,0.5)" }}>AC: </span>
+                            <span style={{ fontSize: "11px", color: DIM_COLOR }}>AC: </span>
                             <span style={styles.profileTag}>
                               {profileLabel(absolute(acTuning).spl, absolute(acTuning).sppt, absolute(acTuning).fppt, savedAcPreset)}
                             </span>
@@ -822,7 +1009,7 @@ const Content: FC = () => {
                 </ButtonItem>
               </PanelSectionRow>
               <PanelSectionRow>
-                <div style={{ fontSize: "11px", fontWeight: "bold", color: acOnline ? "#4ade80" : "#fbbf24" }}>
+                <div style={{ fontSize: "11px", fontWeight: "bold", color: acOnline ? OK_COLOR : WARN_COLOR }}>
                   {acOnline ? "Charging (AC)" : "On battery"}
                 </div>
               </PanelSectionRow>
@@ -913,7 +1100,7 @@ const Content: FC = () => {
 
       <PanelSection title="Extras">
         <PanelSectionRow>
-          <div style={styles.warningBox}>
+          <div style={styles.infoBox}>
             These settings are for advanced users only and are NOT recommended.
             Changes are made at your own risk — they override the manufacturer's TDP safety limits.
           </div>
@@ -933,10 +1120,20 @@ const Content: FC = () => {
   );
 };
 
-export default definePlugin(() => ({
-  name:    "LeGoTDP",
-  title:   <div className={staticClasses.Title}>LeGoTDP</div>,
-  content: <Content />,
-  icon:    <ChipIcon />,
-  onDismount() {},
-}));
+// ── Plugin entry point ─────────────────────────────────────────────────────────
+
+export default definePlugin(() => {
+  // Started here rather than from the panel: the backend enforce loop needs the
+  // running appid whether or not anyone has the Quick Access Menu open.
+  AppWatcher.start();
+
+  return {
+    name: "LeGoTDP",
+    titleView: <div className={staticClasses.Title}>LeGoTDP</div>,
+    content: <Content />,
+    icon: <ChipIcon />,
+    onDismount() {
+      AppWatcher.stop();
+    },
+  };
+});

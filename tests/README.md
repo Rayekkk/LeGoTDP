@@ -22,7 +22,7 @@ or written.
 Copy the repo across and run it there:
 
 ```bash
-scp -r main.py updater.py plugin.json tests deck@<legion>:/tmp/legotdp-tests/
+scp -r main.py lego_updater.py plugin.json tests deck@<legion>:/tmp/legotdp-tests/
 ssh deck@<legion> 'cd /tmp/legotdp-tests && sudo python3 -m unittest discover -s tests -v'
 ```
 

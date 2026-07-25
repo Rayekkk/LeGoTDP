@@ -77,7 +77,7 @@ To copy the files directly instead, install only the runtime payload - copying t
 ```bash
 DEST=~/homebrew/plugins/LeGoTDP
 sudo mkdir -p "$DEST"
-sudo cp -r main.py updater.py plugin.json package.json README.md LICENSE NOTICE dist "$DEST"
+sudo cp -r main.py lego_updater.py plugin.json package.json README.md LICENSE NOTICE dist "$DEST"
 sudo systemctl restart plugin_loader
 ```
 
@@ -153,8 +153,23 @@ The Python backend runs an enforce loop every 5 seconds that:
    after a few attempts on targets the hardware silently refuses
 
 Settings and per-game profiles are persisted through Decky's `SettingsManager`, so they
-survive reinstalling the plugin. Installs from before 1.5.0 kept them inside the plugin
-directory; those files are migrated on the first start after the update.
+survive reinstalling the plugin.
+
+**Upgrading from 1.4.0 or earlier is the one exception.** Those versions kept their
+settings inside the plugin directory, and Decky's installer deletes that directory before
+it extracts the new zip - so by the time 1.5.0 first runs, the old file is already gone.
+There is nothing the new version can do about that from inside. Either write your three
+values down and re-enter them once, or keep them by hand:
+
+```bash
+# before updating
+cp ~/homebrew/plugins/LeGoTDP/settings.json ~/legotdp-settings.json
+# after installing 1.5.0, put it back and reload the plugin from Decky's menu
+sudo cp ~/legotdp-settings.json ~/homebrew/plugins/LeGoTDP/settings.json
+```
+
+The migration then picks it up on the next start and moves it into Decky's settings
+directory for good. From 1.5.0 onward no such step is ever needed again.
 
 `ryzenadj` is fetched automatically from [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj)
 GitHub releases on the first run, over https from a fixed allowlist of GitHub hosts. If that
@@ -215,7 +230,7 @@ python -m unittest discover -s tests -v   # backend tests, see tests/README.md
 
 The frontend is built with [`@decky/rollup`](https://www.npmjs.com/package/@decky/rollup), the official Decky preset, which maps `react`, `react/jsx-runtime`, `react-dom` and `@decky/ui` onto the globals Steam injects rather than bundling them.
 
-`updater.py` is shared verbatim with [LeGo-Vibe-Control](https://github.com/Rayekkk/LeGo-Vibe-Control) - change it in one repo and copy it to the other.
+`lego_updater.py` is shared verbatim with [LeGo-Vibe-Control](https://github.com/Rayekkk/LeGo-Vibe-Control) - change it in one repo and copy it to the other.
 
 CI builds every push and pull request. Pushing a tag such as `1.5.0` builds the zip and publishes a GitHub release; the tag must match the `version` in both `plugin.json` and `package.json`.
 

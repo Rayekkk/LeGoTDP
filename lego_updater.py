@@ -6,6 +6,21 @@ copied between the two repos without producing a diff. Both plugins had grown
 their own drifted copy of this logic; keeping one shape means a fix to the
 trust store or the host allowlist lands in both.
 
+The `lego_` prefix is not decoration. Before running a plugin, the loader
+aliases each of its own submodules to a bare name:
+
+    keys = [key for key in sys.modules if key.startswith("decky_loader.")]
+    for key in keys:
+        sys.modules[key.replace("decky_loader.", "")] = sys.modules[key]
+
+That happens before this module is ever imported, and `import x` consults
+sys.modules before sys.path - so a plugin file called `updater.py` never
+loads at all. `from updater import Updater` silently returned the loader's
+own Updater class and both plugins died on the constructor. The names to
+stay away from are browser, enums, helpers, injector, loader, main, settings,
+updater, utilities and wsrouter. (`settings` is the exception we want: that
+alias is how every plugin reaches SettingsManager.)
+
 Nothing here imports `decky`, so the module can be exercised by the test
 suites without the loader present.
 """

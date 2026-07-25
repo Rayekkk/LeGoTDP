@@ -18,7 +18,10 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
-from updater import Updater  # noqa: E402 - needs the sys.path line above
+# Not `updater`: the loader aliases its own decky_loader.updater to that bare
+# name before we are imported, and sys.modules wins over sys.path. See the
+# module docstring in lego_updater.py.
+from lego_updater import Updater  # noqa: E402 - needs the sys.path line above
 
 BIN_DIR       = os.path.join(PLUGIN_DIR, "bin")
 BIN_PATH      = os.path.join(BIN_DIR, "ryzenadj")

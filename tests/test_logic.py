@@ -1,5 +1,6 @@
 """Backend tests that need no Legion Go attached. These run in CI."""
 import asyncio
+import glob
 import json
 import os
 import ssl
@@ -369,6 +370,7 @@ class LimitsCache(unittest.TestCase):
         main._last_source = "ryzenadj"      # force the expensive path
         main._invalidate_limits_cache()
         self._real_run = main._run_ryzenadj
+        self._real_caps = main._wmi_caps
         self.info_calls = 0
 
         def fake(args, timeout=5.0):
@@ -377,9 +379,15 @@ class LimitsCache(unittest.TestCase):
                 return 0, self.INFO, ""
             return 0, "", ""                # an apply
         main._run_ryzenadj = fake
+        # Pretend the firmware is absent, so _apply_limits stays on the faked
+        # ryzenadj path. On a real Legion it would otherwise take the WMI path,
+        # reset _last_source to "wmi" and - the actual problem - write live
+        # limits to the firmware from a suite that promises to touch nothing.
+        main._wmi_caps = lambda: {}
 
     def tearDown(self):
         main._run_ryzenadj = self._real_run
+        main._wmi_caps = self._real_caps
         main._last_source = ""
         main._invalidate_limits_cache()
 
@@ -409,13 +417,20 @@ class LimitsCache(unittest.TestCase):
 class RaplDiscovery(unittest.TestCase):
     def setUp(self):
         self._dir, self._ts = main._rapl_dir, main._rapl_probed_at
+        self._glob = main.RAPL_GLOB
 
     def tearDown(self):
         main._rapl_dir, main._rapl_probed_at = self._dir, self._ts
+        main.RAPL_GLOB = self._glob
 
     def test_a_miss_is_retried_rather_than_remembered_forever(self):
         # powercap can register after the plugin starts; caching the miss left
         # the package draw blank until the plugin was reloaded.
+        #
+        # The miss has to be manufactured: a real Legion has powercap, so
+        # without this the probe below finds it and the test only passed on a
+        # dev box that has no /sys at all.
+        main.RAPL_GLOB = "/nonexistent/powercap/intel-rapl:*"
         main._rapl_dir, main._rapl_probed_at = None, 0.0
         self.assertIsNone(main._find_rapl_package())
         self.assertEqual(main._rapl_dir, "")
@@ -454,6 +469,45 @@ class UpdateUrlValidation(unittest.TestCase):
 
     def test_the_ryzenadj_download_passes_its_own_check(self):
         self.assertTrue(updater.checked_url(main.RYZENADJ_URL))
+
+
+class ShippedModuleNames(unittest.TestCase):
+    """Before a plugin is imported, the loader aliases every one of its own
+    submodules to a bare name:
+
+        for key in [k for k in sys.modules if k.startswith("decky_loader.")]:
+            sys.modules[key.replace("decky_loader.", "")] = sys.modules[key]
+
+    `import x` consults sys.modules before sys.path, so a plugin file named
+    after one of them never loads at all - the import silently hands back the
+    loader's module instead. That is exactly how a shared `updater.py` shipped
+    and killed both plugins on startup with a TypeError from the wrong Updater.
+    """
+
+    RESERVED = frozenset({
+        "browser", "enums", "helpers", "injector", "loader",
+        "main", "settings", "updater", "utilities", "wsrouter",
+    })
+
+    def test_no_shipped_module_is_shadowed_by_the_loader(self):
+        shipped = {
+            os.path.splitext(os.path.basename(path))[0]
+            for path in glob.glob(os.path.join(main.PLUGIN_DIR, "*.py"))
+        }
+        # main.py is the one exemption: the loader loads it from an explicit
+        # file location rather than by module name.
+        self.assertEqual(sorted((shipped & self.RESERVED) - {"main"}), [])
+
+    def test_the_packaged_payload_matches_what_we_import(self):
+        # The zip is what reaches the device, so a rename that misses
+        # scripts/package.mjs ships a plugin with no updater module at all.
+        script = os.path.join(main.PLUGIN_DIR, "scripts", "package.mjs")
+        if not os.path.isfile(script):
+            self.skipTest("repo-only check; the deployed plugin ships no scripts/")
+        with open(script) as handle:
+            packaged = handle.read()
+        self.assertIn('"lego_updater.py"', packaged)
+        self.assertNotIn('"updater.py"', packaged)
 
 
 class Versions(unittest.TestCase):

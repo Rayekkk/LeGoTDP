@@ -27,7 +27,7 @@ jobs:
           python-version: "3.13"
 
       - name: Check the backend parses
-        run: python -m compileall -q main.py updater.py
+        run: python -m compileall -q main.py lego_updater.py
 
       # test_device.py skips itself here; there is no Legion Go on a runner.
       - name: Backend tests

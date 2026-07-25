@@ -390,6 +390,10 @@ const ChipIcon: FC = () => (
 );
 
 // ── Live TDP panel ─────────────────────────────────────────────────────────────
+
+// Must stay comfortably under _PANEL_ACTIVE_TTL_S in main.py (90 s).
+const PANEL_LEASE_MS = 30000;
+
 const LivePanel: FC = () => {
   const [info, setInfo] = useState<TdpInfo | null>(null);
   const visible = useQuickAccessVisible();
@@ -402,10 +406,17 @@ const LivePanel: FC = () => {
   // The backend pushes each refresh rather than answering a poll: it already
   // recomputed these numbers on exactly this cadence, so asking for them over
   // RPC was a round trip to be handed something that already existed.
+  //
+  // The lease is renewed rather than set once. The cleanup below drops it, but
+  // it never runs if the frontend is torn down outright - a Steam UI restart -
+  // and the backend would then keep refreshing forever. Thirty seconds against
+  // the backend's ninety leaves room for two lost calls, and is still fifteen
+  // times less traffic than the two-second poll this replaced.
   useEffect(() => {
     if (!visible) return;
     let active = true;
     setPanelActive(true);
+    const lease = setInterval(() => setPanelActive(true), PANEL_LEASE_MS);
     const onInfo = (next: TdpInfo) => { if (active) setInfo(next); };
     addEventListener<[TdpInfo]>("tdp_info", onInfo);
     // Seed it: the first push is a full interval away, and the panel would
@@ -413,6 +424,7 @@ const LivePanel: FC = () => {
     getTdpInfo().then((v) => { if (active) setInfo(v); }).catch(() => undefined);
     return () => {
       active = false;
+      clearInterval(lease);
       removeEventListener<[TdpInfo]>("tdp_info", onInfo);
       setPanelActive(false);
     };

@@ -10,10 +10,16 @@ from _harness import (
     FIXTURE,
     GAME_WITHOUT_PROFILE,
     GAME_WITH_PROFILE,
+    emitted,
     main,
     seed,
     updater,
 )
+
+
+def _explode() -> None:
+    """Stand-in for a store that cannot be read or committed."""
+    raise OSError("disk on fire")
 
 
 class ClampTriplet(unittest.TestCase):
@@ -205,6 +211,18 @@ class Migration(unittest.TestCase):
         asyncio.run(main.Plugin()._migration())
         self.assertEqual(main._load_settings()["spl"], 8000)
 
+    def test_a_failed_migration_is_reported_not_raised(self):
+        # The loader wraps start-up in a bare except that logs and exits, and it
+        # never reaches setup_server() - so a raise here would strand the panel
+        # retrying an is_ready() with nobody left to answer it.
+        original, main._migrate = main._migrate, _explode
+        try:
+            asyncio.run(main.Plugin()._migration())
+        finally:
+            main._migrate = original
+            self.addCleanup(setattr, main.Plugin, "_setup_error", None)
+        self.assertIn("disk on fire", main.Plugin._setup_error or "")
+
     def test_the_legacy_file_is_not_handed_to_decky_migrate_settings(self):
         # decky.migrate_settings() would tar the legacy file into
         # DECKY_PLUGIN_SETTINGS_DIR under its own basename and rm -rf the source.
@@ -259,6 +277,61 @@ class EnforceEvents(unittest.TestCase):
         main._save_settings(settings)
         self.assertEqual(self._pass(True), {})
         self.assertEqual(self.applied, [])
+
+
+class PanelLease(unittest.IsolatedAsyncioTestCase):
+    """set_panel_active is a lease, not a latch. The panel drops it in its
+    effect cleanup, but that never runs if the frontend is torn down outright -
+    a Steam UI restart - and the info loop would then refresh forever."""
+
+    def setUp(self):
+        seed(FIXTURE)
+        emitted.clear()
+        self.addCleanup(setattr, main, "_panel_active", False)
+        self.addCleanup(setattr, main, "_panel_active_ts", 0.0)
+
+    @staticmethod
+    def _age(seconds: float) -> None:
+        """Backdate the lease. Cheaper and less invasive than moving the clock:
+        patching time.monotonic patches it for asyncio too, which then reports
+        every await as a stalled callback."""
+        main._panel_active_ts -= seconds
+
+    async def test_a_fresh_lease_is_active(self):
+        await main.Plugin().set_panel_active(True)
+        self.assertTrue(main._panel_is_active())
+
+    async def test_the_lease_expires_when_nobody_renews_it(self):
+        await main.Plugin().set_panel_active(True)
+        self._age(main._PANEL_ACTIVE_TTL_S + 1)
+        self.assertFalse(main._panel_is_active())
+
+    async def test_renewing_it_keeps_the_panel_alive(self):
+        plugin = main.Plugin()
+        await plugin.set_panel_active(True)
+        # The frontend renews every 30 s against a 90 s window, so two renewals
+        # can be lost in a row without the panel going dark.
+        for _ in range(4):
+            self._age(main._PANEL_ACTIVE_TTL_S / 3)
+            await plugin.set_panel_active(True)
+            self.assertTrue(main._panel_is_active())
+
+    async def test_closing_the_panel_drops_it_immediately(self):
+        plugin = main.Plugin()
+        await plugin.set_panel_active(True)
+        await plugin.set_panel_active(False)
+        self.assertFalse(main._panel_is_active())
+
+    async def test_nothing_is_pushed_once_the_lease_lapses(self):
+        plugin = main.Plugin()
+        await plugin.set_panel_active(True)
+        self.assertTrue(await plugin._push_info())
+        self.assertEqual([name for name, _ in emitted], ["tdp_info"])
+
+        emitted.clear()
+        self._age(main._PANEL_ACTIVE_TTL_S + 1)
+        self.assertFalse(await plugin._push_info())
+        self.assertEqual(emitted, [])
 
 
 class RyzenadjOutput(unittest.TestCase):

@@ -76,7 +76,16 @@ _ROW_RE = re.compile(r"\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|")
 
 _current_game_id: str = ""
 _current_ac_online: bool = False
+
+# The panel says when it is on screen, and re-says it every 30 s while it stays
+# there. The timestamp is what makes that a lease rather than a latch: a
+# frontend that goes away without running its cleanup - a Steam UI restart, say
+# - used to leave the info loop reading RAPL every two seconds, and spawning
+# `ryzenadj --info` every fifteen with Extras on, for the rest of the session.
+# _frontend_appid below is leased the same way for the same reason.
 _panel_active: bool = False
+_panel_active_ts: float = 0.0
+_PANEL_ACTIVE_TTL_S = 90.0
 
 # The frontend detects the running game via Steam's Router, which is authoritative;
 # the /proc/*/environ scan misses games sandboxed by pressure-vessel/gamescope. When
@@ -119,6 +128,11 @@ def _get_ac_online() -> bool:
     # No Mains supply exposed at all - fall back to battery status.
     status = _read_sysfs("/sys/class/power_supply/BAT0/status")
     return status not in ("", "Discharging", "Unknown")
+
+
+def _panel_is_active() -> bool:
+    """True while the panel's lease is unexpired. See _PANEL_ACTIVE_TTL_S."""
+    return _panel_active and time.monotonic() - _panel_active_ts < _PANEL_ACTIVE_TTL_S
 
 
 def _pick_profile_values(p: dict, ac_online: bool) -> tuple[int, int, int]:
@@ -818,7 +832,7 @@ def _enforce_target(want: tuple) -> None:
         _drift_target, _drift_settled, _drift_attempts = want, (), 0
 
     with _info_cache_lock:
-        parsed = dict(_info_cache) if _panel_active else {}
+        parsed = dict(_info_cache) if _panel_is_active() else {}
     if not parsed:
         parsed = _read_limits()
     cur = tuple(parsed.get(f"{k}_limit") for k in ("spl", "sppt", "fppt"))
@@ -1000,8 +1014,10 @@ class Plugin:
         return await loop.run_in_executor(None, _do)
 
     async def set_panel_active(self, active: bool) -> None:
-        global _panel_active
+        """Renew (or drop) the panel's lease on the info loop."""
+        global _panel_active, _panel_active_ts
         _panel_active = active
+        _panel_active_ts = time.monotonic() if active else 0.0
 
     async def reapply(self) -> dict:
         """Force the saved limits back onto the hardware.
@@ -1089,19 +1105,28 @@ class Plugin:
     async def perform_update(self, download_url: str, asset_name: str) -> dict:
         return await _offload(updater.download, download_url, asset_name)
 
+    async def _push_info(self) -> bool:
+        """One refresh, pushed to the panel. True when something went out.
+
+        Split out of _info_loop so the emit itself can be tested - the loop
+        around it never terminates, so there is no way to await one iteration.
+        """
+        if not _panel_is_active():
+            return False
+        await _offload(_refresh_info_cache)
+        with _info_cache_lock:
+            values = dict(_info_cache)
+        # Pushed, not polled. The panel used to ask for this over RPC every two
+        # seconds - a round trip per tick to fetch numbers the backend had just
+        # refreshed on this very schedule.
+        await decky.emit("tdp_info", {"success": True, "values": values})
+        return True
+
     async def _info_loop(self):
         while True:
             await asyncio.sleep(2)
-            if not _panel_active:
-                continue
             try:
-                await _offload(_refresh_info_cache)
-                with _info_cache_lock:
-                    values = dict(_info_cache)
-                # Pushed, not polled. The panel used to ask for this over RPC every
-                # two seconds - a round trip per tick to fetch numbers the backend
-                # had just refreshed on this very schedule.
-                await decky.emit("tdp_info", {"success": True, "values": values})
+                await self._push_info()
             except Exception as e:
                 decky.logger.warning(f"[legotdp] info loop error: {e}")
 
@@ -1126,8 +1151,19 @@ class Plugin:
         SettingsManager store - identical filename - and replace the whole
         keyed object with a flat pre-1.5.0 dict. That helper moves files; this
         migration has to reshape them.
+
+        Nothing may escape. The loader runs this with run_until_complete inside
+        a bare except that logs and sys.exit(0)s, and it never gets as far as
+        creating the RPC socket - so a raise here would leave the panel retrying
+        an is_ready() that has nobody to answer it, spinning on "Initializing"
+        forever. Recording the failure instead tells the user their old settings
+        did not come across, before they start rebuilding them on top.
         """
-        await _offload(_migrate)
+        try:
+            await _offload(_migrate)
+        except Exception as e:
+            Plugin._setup_error = f"settings migration failed: {e}"
+            decky.logger.error(f"[legotdp] migration failed: {e}")
 
     async def _main(self):
         decky.logger.info(f"[legotdp] startup  v{updater.plugin_version()}")

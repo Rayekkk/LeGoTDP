@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "build": "rollup -c",
-    "watch": "rollup -c -w"
+    "watch": "rollup -c -w",
+    "typecheck": "tsc --noEmit",
+    "package": "node scripts/package.mjs"
   },
   "devDependencies": {
     "@decky/api": "^1.1.3",

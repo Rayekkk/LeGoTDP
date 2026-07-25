@@ -4,7 +4,6 @@ import glob
 import json
 import os
 import re
-import shutil
 import ssl
 import stat
 import subprocess
@@ -13,6 +12,7 @@ import tempfile
 import time
 import pwd
 import threading
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -26,6 +26,20 @@ RYZENADJ_URL  = (
     "ryzenadj-manylinux_2_28-x86_64.tar.gz"
 )
 GITHUB_API_URL = "https://api.github.com/repos/Rayekkk/LeGoTDP/releases/latest"
+
+# Only these hosts may be fetched by the downloader. The plugin runs as root and
+# executes what it downloads (ryzenadj), so an unrestricted URL would be an
+# arbitrary-fetch-and-run primitive.
+_ALLOWED_HOSTS = frozenset({
+    "api.github.com",
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+})
+
+# Refuse absurd downloads. The ryzenadj tarball and release zips are a few MB.
+_MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
 
 DEFAULT_SETTINGS = {"spl": 15000, "sppt": 15000, "fppt": 15000, "enabled": True}
 
@@ -55,9 +69,98 @@ _info_cache_lock = threading.Lock()
 
 _ROW_RE = re.compile(r"\|\s*(.+?)\s*\|\s*([\d.]+)\s*\|")
 
-_ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+# Decky runs plugins inside a PyInstaller-frozen PluginLoader whose OpenSSL has its
+# CA paths baked in from the build machine. They do not exist on the device, so
+# ssl.create_default_context() comes back with an empty trust store and every request
+# dies with CERTIFICATE_VERIFY_FAILED - which is what the old CERT_NONE worked around.
+# Point the context at a real bundle instead of turning verification off.
+_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",   # Arch, SteamOS, Debian
+    "/etc/ssl/cert.pem",                    # Alpine, macOS, also present on SteamOS
+    "/etc/pki/tls/certs/ca-bundle.crt",     # Fedora, RHEL
+    "/etc/ssl/ca-bundle.pem",               # openSUSE
+)
+
+_ssl_ctx: Optional[ssl.SSLContext] = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    global _ssl_ctx
+    if _ssl_ctx is not None:
+        return _ssl_ctx
+
+    ctx = ssl.create_default_context()
+    if ctx.cert_store_stats().get("x509_ca"):
+        decky.logger.info("[legotdp] TLS: using the default trust store")
+        _ssl_ctx = ctx
+        return ctx
+
+    # Prefer the OS bundle (it gets security updates) over the copy of certifi the
+    # frozen loader unpacks into a /tmp/_MEI* dir that changes on every restart.
+    candidates = list(_CA_BUNDLES)
+    try:
+        import certifi
+        candidates.append(certifi.where())
+    except Exception:
+        pass
+
+    for path in candidates:
+        try:
+            if not path or not os.path.exists(path):
+                continue
+            ctx.load_verify_locations(cafile=path)
+            if ctx.cert_store_stats().get("x509_ca"):
+                decky.logger.info(
+                    f"[legotdp] TLS: default store was empty, loaded CA bundle {path} "
+                    f"({ctx.cert_store_stats()['x509_ca']} certs)")
+                _ssl_ctx = ctx
+                return ctx
+        except OSError as exc:
+            decky.logger.warning(f"[legotdp] TLS: cannot load {path}: {exc}")
+
+    # Verification stays on. Failing loudly beats silently trusting anything, since
+    # this runs as root and downloads a binary it then executes.
+    decky.logger.error("[legotdp] TLS: no usable CA bundle found, downloads will fail to verify")
+    _ssl_ctx = ctx
+    return ctx
+
+
+def _checked_url(url: str) -> str:
+    """Reject anything that is not an https URL on a known GitHub host."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"refusing non-https URL scheme '{parsed.scheme}'")
+    if (parsed.hostname or "").lower() not in _ALLOWED_HOSTS:
+        raise ValueError(f"refusing download from untrusted host '{parsed.hostname}'")
+    return url
+
+
+def _open_url(url: str, timeout: int, headers: Optional[dict] = None):
+    """urlopen with certificate verification left switched on and the host checked."""
+    request = urllib.request.Request(
+        _checked_url(url),
+        headers=headers or {"User-Agent": "LeGoTDP"},
+    )
+    return urllib.request.urlopen(request, context=_ssl_context(), timeout=timeout)
+
+
+def _download_to(url: str, out, timeout: int) -> int:
+    """Stream a URL into a file object, aborting past the size ceiling. Returns bytes."""
+    written = 0
+    with _open_url(url, timeout=timeout) as resp:
+        while True:
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > _MAX_DOWNLOAD_BYTES:
+                raise ValueError("download exceeded the size limit")
+            out.write(chunk)
+    return written
+
+
+def _version_tuple(text: str) -> tuple:
+    return tuple(int(part) for part in re.findall(r"\d+", text))
 
 _current_game_id: str = ""
 _current_ac_online: bool = False
@@ -207,9 +310,8 @@ def _download_ryzenadj() -> None:
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz")
     os.close(tmp_fd)
     try:
-        with urllib.request.urlopen(RYZENADJ_URL, context=_ssl_ctx, timeout=30) as resp, \
-             open(tmp_path, "wb") as out:
-            shutil.copyfileobj(resp, out)
+        with open(tmp_path, "wb") as out:
+            _download_to(RYZENADJ_URL, out, timeout=30)
         with tarfile.open(tmp_path, "r:gz") as tar:
             member = next(
                 (m for m in tar.getmembers()
@@ -921,25 +1023,27 @@ class Plugin:
     async def check_update(self) -> dict:
         def _do() -> dict:
             try:
-                req = urllib.request.Request(
-                    GITHUB_API_URL,
-                    headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "LeGoTDP"},
-                )
-                with urllib.request.urlopen(req, context=_ssl_ctx, timeout=10) as resp:
-                    data = json.loads(resp.read())
+                with _open_url(GITHUB_API_URL, timeout=10, headers={
+                    "Accept": "application/vnd.github.v3+json", "User-Agent": "LeGoTDP"}) as resp:
+                    data = json.loads(resp.read(_MAX_DOWNLOAD_BYTES))
                 tag = data.get("tag_name", "")
                 if not tag:
                     raise ValueError("GitHub API response missing tag_name")
                 latest_ver = tag.lstrip("v").split("-")[0]
                 with open(os.path.join(PLUGIN_DIR, "plugin.json")) as f:
                     current_ver = json.load(f).get("version", "0.0.0").split("-")[0]
-                def _v(s):
-                    return tuple(int(x) for x in s.split("."))
+                latest_t, current_t = _version_tuple(latest_ver), _version_tuple(current_ver)
+                # A tag that is not purely numeric leaves one tuple empty; fall back to
+                # a string comparison rather than raising.
+                if latest_t and current_t:
+                    available = latest_t > current_t
+                else:
+                    available = latest_ver != current_ver
                 asset = next((a for a in data.get("assets", []) if a.get("name", "").endswith(".zip")), None)
                 return {
                     "current_version":  current_ver,
                     "latest_version":   latest_ver,
-                    "update_available": _v(latest_ver) > _v(current_ver),
+                    "update_available": available,
                     "download_url":     asset.get("browser_download_url") if asset else None,
                     "asset_name":       asset.get("name") if asset else None,
                 }
@@ -951,6 +1055,7 @@ class Plugin:
 
     async def perform_update(self, download_url: str, asset_name: str) -> dict:
         def _do() -> dict:
+            dest = None
             try:
                 user = next(
                     (p for p in sorted(pwd.getpwall(), key=lambda p: p.pw_uid)
@@ -968,15 +1073,21 @@ class Plugin:
                     os.unlink(dest)
                 except FileNotFoundError:
                     pass
-                with urllib.request.urlopen(download_url, context=_ssl_ctx, timeout=60) as resp, \
-                     open(dest, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                with open(dest, "wb") as f:
+                    written = _download_to(download_url, f, timeout=60)
                 if user:
                     os.chown(dest, user.pw_uid, user.pw_gid)
-                decky.logger.info(f"[legotdp] update downloaded to {dest}")
+                os.chmod(dest, 0o644)
+                decky.logger.info(f"[legotdp] update downloaded to {dest} ({written} bytes)")
                 return {"success": True, "path": dest}
             except Exception as e:
                 decky.logger.error(f"[legotdp] perform_update: {e}")
+                # Never leave a truncated or oversized file behind.
+                if dest:
+                    try:
+                        os.unlink(dest)
+                    except OSError:
+                        pass
                 return {"success": False, "error": str(e)}
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _do)
@@ -1005,6 +1116,9 @@ class Plugin:
         try:
             global _current_ac_online
             loop = asyncio.get_running_loop()
+            # Resolve the trust store now so the log states up front whether downloads
+            # and update checks will be able to verify certificates.
+            await loop.run_in_executor(None, _ssl_context)
             # Seed this so the first enforce pass does not report a phantom AC change.
             _current_ac_online = await loop.run_in_executor(None, _get_ac_online)
             wmi = await loop.run_in_executor(None, _wmi_caps)

@@ -40,7 +40,13 @@ updater = Updater(
     logger=decky.logger,
 )
 
-DEFAULT_SETTINGS = {"spl": 15000, "sppt": 15000, "fppt": 15000, "enabled": True}
+# Matches the Balanced preset in src/index.tsx, so a fresh install and the
+# preset the panel highlights agree with each other.
+DEFAULT_SETTINGS = {"spl": 15000, "sppt": 18000, "fppt": 25000, "enabled": True}
+
+# Reported by get_caps() when the firmware does not answer. The frontend carries
+# the same numbers as FALLBACK_STD for the moments before get_caps() returns.
+FALLBACK_STD_W = {"spl": 35, "sppt": 37, "fppt": 45}
 
 # Absolute floor/ceiling for any single limit, in milliwatts. Applied on load, which
 # also migrates profiles saved back when the Extras ceiling was 60 W.
@@ -153,6 +159,16 @@ LEGACY_PROFILES_FILE = os.path.join(PLUGIN_DIR, "profiles.json")
 # The enforce loop reads settings from an executor thread while RPC handlers
 # write them from the event loop. Re-entrant because the write paths load first.
 _settings_lock = threading.RLock()
+
+
+async def _offload(fn, *args):
+    """Run blocking work off the event loop.
+
+    Settings I/O, sysfs reads and waiting on _settings_lock or _apply_lock all
+    block. Decky runs every plugin on one shared event loop, so a handler that
+    blocks here stalls the whole loader.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
 
 def _read_key(key: str, default: dict) -> dict:
@@ -493,22 +509,33 @@ def _apply_wmi(spl_w: int, sppt_w: int, fppt_w: int) -> dict:
 
 # ── RAPL package power ─────────────────────────────────────────────────────────
 
+# None = never probed, "" = probed and not found. A miss is retried: powercap can
+# register after the plugin starts, and remembering the failure forever left the
+# package draw reading blank until the plugin was reloaded.
 _rapl_dir: str | None = None
+_rapl_probed_at: float = 0.0
+_RAPL_RESCAN_S = 60.0
 _rapl_last: tuple = ()
 
 
 def _find_rapl_package() -> str | None:
-    global _rapl_dir
-    if _rapl_dir is None:
-        _rapl_dir = ""
-        for d in sorted(glob.glob(RAPL_GLOB)):
-            try:
-                with open(os.path.join(d, "name")) as f:
-                    if f.read().strip().startswith("package"):
-                        _rapl_dir = d
-                        break
-            except OSError:
-                continue
+    global _rapl_dir, _rapl_probed_at
+    if _rapl_dir:
+        return _rapl_dir
+    now = time.monotonic()
+    if _rapl_dir is not None and now - _rapl_probed_at < _RAPL_RESCAN_S:
+        return None
+
+    _rapl_probed_at = now
+    _rapl_dir = ""
+    for d in sorted(glob.glob(RAPL_GLOB)):
+        try:
+            with open(os.path.join(d, "name")) as f:
+                if f.read().strip().startswith("package"):
+                    _rapl_dir = d
+                    break
+        except OSError:
+            continue
     return _rapl_dir or None
 
 
@@ -558,12 +585,14 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
             result = _apply_wmi(*(v for _, v in triple_w))
             if result["success"]:
                 _last_source = "wmi"
+                _invalidate_limits_cache()
                 return result
             decky.logger.warning(
                 f"[legotdp] WMI apply failed ({result['stderr']}), falling back to ryzenadj")
         result = _apply_ryzenadj(spl_mw, sppt_mw, fppt_mw)
         if result["success"]:
             _last_source = "ryzenadj"
+            _invalidate_limits_cache()
         return result
     finally:
         _apply_lock.release()
@@ -579,6 +608,25 @@ def _wmi_profile_lost() -> bool:
     return path is not None and _read_profile(path) != "custom"
 
 
+# Reading limits over WMI is three sysfs reads. On the ryzenadj path it spawns a
+# process, and the enforce loop asks every five seconds whether or not anyone has
+# the panel open - so with Extras enabled that was a `ryzenadj --info` every five
+# seconds forever, including mid-game. Serve a recent answer instead. The window
+# is well inside the ryzenadj drift tolerance (6 W), which only exists to catch a
+# post-resume reset, and _apply_limits drops the cache so a change we made is
+# never hidden behind it.
+_LIMITS_CACHE_TTL_S = 15.0
+_limits_cache: dict = {}
+_limits_cache_ts: float = 0.0
+_limits_cache_lock = threading.Lock()
+
+
+def _invalidate_limits_cache() -> None:
+    global _limits_cache, _limits_cache_ts
+    with _limits_cache_lock:
+        _limits_cache, _limits_cache_ts = {}, 0.0
+
+
 def _read_limits() -> dict:
     """Current limits in watts, read from whichever layer last applied them.
 
@@ -586,17 +634,28 @@ def _read_limits() -> dict:
     attributes still report the firmware's own stale bookkeeping, so reading the
     wrong one would misreport the active limits.
     """
+    global _limits_cache, _limits_cache_ts
     if _last_source == "wmi":
         vals = {f"{k}_limit": _wmi_read(k, "current_value") for k in WMI_ATTRS}
         if all(v is not None for v in vals.values()):
             return {k: float(v) for k, v in vals.items()}
+
+    with _limits_cache_lock:
+        if _limits_cache and time.monotonic() - _limits_cache_ts < _LIMITS_CACHE_TTL_S:
+            return dict(_limits_cache)
+
     if not _ryzenadj_lock.acquire(timeout=4.0):
         return {}
     try:
         rc, out, _ = _run_ryzenadj(["--info"], timeout=3.0)
     finally:
         _ryzenadj_lock.release()
-    return _parse_ryzenadj_output(out) if rc == 0 else {}
+
+    parsed = _parse_ryzenadj_output(out) if rc == 0 else {}
+    if parsed:
+        with _limits_cache_lock:
+            _limits_cache, _limits_cache_ts = dict(parsed), time.monotonic()
+    return parsed
 
 
 # ── Info cache refresh ─────────────────────────────────────────────────────────
@@ -806,15 +865,13 @@ class Plugin:
         return {"version": updater.plugin_version()}
 
     async def get_settings(self) -> dict:
-        return _load_settings()
+        return await _offload(_load_settings)
 
     async def get_power_source(self) -> dict:
-        loop = asyncio.get_running_loop()
-        return {"ac": await loop.run_in_executor(None, _get_ac_online)}
+        return {"ac": await _offload(_get_ac_online)}
 
     async def get_extras_unlocked(self) -> bool:
-        loop = asyncio.get_running_loop()
-        s = await loop.run_in_executor(None, _load_settings)
+        s = await _offload(_load_settings)
         return s.get("extras_unlocked", False)
 
     async def set_extras_unlocked(self, enabled: bool) -> None:
@@ -822,61 +879,73 @@ class Plugin:
             s = _load_settings()
             s["extras_unlocked"] = enabled
             _save_settings(s)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _do)
+        await _offload(_do)
         decky.logger.info(f"[legotdp] extras_unlocked={enabled}")
 
     async def get_game_profile(self, app_id: str) -> dict:
-        profiles = _load_profiles()
-        p = profiles.get(app_id)
-        if p is None:
-            return {"exists": False, "profile": {}, "ac_separate": False, "ac_profile": {}}
-        spl  = p.get("spl",  DEFAULT_SETTINGS["spl"])
-        sppt = p.get("sppt", DEFAULT_SETTINGS["sppt"])
-        fppt = p.get("fppt", DEFAULT_SETTINGS["fppt"])
-        return {
-            "exists":      True,
-            "profile":     {"spl": spl, "sppt": sppt, "fppt": fppt, "preset": p.get("preset", "")},
-            "ac_separate": p.get("ac_separate", False),
-            "ac_profile":  {"spl": p.get("ac_spl", spl), "sppt": p.get("ac_sppt", sppt), "fppt": p.get("ac_fppt", fppt), "ac_preset": p.get("ac_preset", "")},
-        }
+        def _do() -> dict:
+            p = _load_profiles().get(app_id)
+            if p is None:
+                return {"exists": False, "profile": {}, "ac_separate": False, "ac_profile": {}}
+            spl  = p.get("spl",  DEFAULT_SETTINGS["spl"])
+            sppt = p.get("sppt", DEFAULT_SETTINGS["sppt"])
+            fppt = p.get("fppt", DEFAULT_SETTINGS["fppt"])
+            return {
+                "exists":      True,
+                "profile":     {"spl": spl, "sppt": sppt, "fppt": fppt,
+                                "preset": p.get("preset", "")},
+                "ac_separate": p.get("ac_separate", False),
+                "ac_profile":  {"spl": p.get("ac_spl", spl), "sppt": p.get("ac_sppt", sppt),
+                                "fppt": p.get("ac_fppt", fppt),
+                                "ac_preset": p.get("ac_preset", "")},
+            }
+        return await _offload(_do)
 
     async def set_game_ac_profile(self, app_id: str, spl: int, sppt: int, fppt: int, ac_separate: bool, preset_name: str = "") -> dict:
-        profiles = _load_profiles()
-        p = profiles.get(app_id, {})
-        update = {"ac_separate": ac_separate, "ac_spl": spl, "ac_sppt": sppt, "ac_fppt": fppt}
-        if preset_name:
-            update["ac_preset"] = preset_name
-        p.update(update)
-        profiles[app_id] = p
-        _save_profiles(profiles)
-        decky.logger.info(f"[legotdp] Saved AC profile: app={app_id} separate={ac_separate}")
-        ac_now = _get_ac_online()
-        loop = asyncio.get_running_loop()
-        if ac_now and ac_separate:
-            result = await loop.run_in_executor(None, _apply_limits, spl, sppt, fppt)
+        def _do() -> dict:
+            # Clamp before storing, not just on read, so the file on disk never
+            # holds a triplet the hardware would refuse.
+            ac = _clamp_triplet(spl, sppt, fppt)
+            profiles = _load_profiles()
+            p = profiles.get(app_id, {})
+            p.update({"ac_separate": ac_separate,
+                      "ac_spl": ac[0], "ac_sppt": ac[1], "ac_fppt": ac[2]})
+            if preset_name:
+                p["ac_preset"] = preset_name
+            profiles[app_id] = p
+            _save_profiles(profiles)
+            decky.logger.info(
+                f"[legotdp] Saved AC profile: app={app_id} separate={ac_separate}")
+
+            if not _get_ac_online():
+                return {"success": True, "stderr": "", "stdout": "", "returncode": 0}
+            if ac_separate:
+                want = ac
+            elif all(p.get(k) is not None for k in ("spl", "sppt", "fppt")):
+                want = (p["spl"], p["sppt"], p["fppt"])
+            else:
+                return {"success": True, "stderr": "", "stdout": "", "returncode": 0}
+
+            result = _apply_limits(*want)
             if result["success"]:
-                s = _load_settings()
-                _save_active(s, spl, sppt, fppt)
+                _save_active(_load_settings(), *want)
             return result
-        if ac_now and not ac_separate and p.get("spl") is not None and p.get("sppt") is not None and p.get("fppt") is not None:
-            result = await loop.run_in_executor(None, _apply_limits, p["spl"], p["sppt"], p["fppt"])
-            if result["success"]:
-                s = _load_settings()
-                _save_active(s, p["spl"], p["sppt"], p["fppt"])
-            return result
-        return {"success": True, "stderr": "", "stdout": "", "returncode": 0}
+        return await _offload(_do)
 
     async def delete_game_profile(self, app_id: str) -> None:
-        profiles = _load_profiles()
-        profiles.pop(app_id, None)
-        _save_profiles(profiles)
+        def _do() -> None:
+            profiles = _load_profiles()
+            profiles.pop(app_id, None)
+            _save_profiles(profiles)
+        await _offload(_do)
         decky.logger.info(f"[legotdp] Deleted game profile: app={app_id}")
 
     async def set_plugin_enabled(self, enabled: bool) -> None:
-        s = _load_settings()
-        s["enabled"] = enabled
-        _save_settings(s)
+        def _do() -> None:
+            s = _load_settings()
+            s["enabled"] = enabled
+            _save_settings(s)
+        await _offload(_do)
         decky.logger.info(f"[legotdp] Plugin enabled={enabled}")
 
     async def get_caps(self) -> dict:
@@ -886,13 +955,11 @@ class Plugin:
             caps = _wmi_caps()
             return {
                 "min": min(caps[k]["min"] for k in WMI_ATTRS) if caps else HARD_MIN_MW // 1000,
-                "std": {k: caps[k]["max"] for k in WMI_ATTRS} if caps
-                       else {"spl": 35, "sppt": 37, "fppt": 45},
+                "std": {k: caps[k]["max"] for k in WMI_ATTRS} if caps else dict(FALLBACK_STD_W),
                 "max": {k: HARD_MAX_MW // 1000 for k in WMI_ATTRS},
                 "wmi": bool(caps),
             }
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _do)
+        return await _offload(_do)
 
     async def restore_defaults(self) -> dict:
         def _do() -> dict:
@@ -941,22 +1008,28 @@ class Plugin:
         if not self._ready:
             return {"success": False, "stderr": "not ready", "stdout": "", "returncode": -1}
 
-        loop = asyncio.get_running_loop()
-        profiles: dict | None = None
-        existing: dict = {}
-        apply_spl, apply_sppt, apply_fppt = spl, sppt, fppt
+        def _do() -> dict:
+            profiles: dict = {}
+            existing: dict = {}
+            want = (spl, sppt, fppt)
 
-        if app_id:
-            profiles = _load_profiles()
-            existing = profiles.get(app_id, {})
-            if _get_ac_online() and existing.get("ac_separate") and existing.get("ac_spl") is not None:
-                apply_spl  = existing["ac_spl"]
-                apply_sppt = existing.get("ac_sppt", existing.get("sppt", DEFAULT_SETTINGS["sppt"]))
-                apply_fppt = existing.get("ac_fppt", existing.get("fppt", DEFAULT_SETTINGS["fppt"]))
+            if app_id:
+                profiles = _load_profiles()
+                existing = profiles.get(app_id, {})
+                # On AC with a separate AC profile, the sliders describe the
+                # battery values but the hardware should run the AC ones.
+                if (_get_ac_online() and existing.get("ac_separate")
+                        and existing.get("ac_spl") is not None):
+                    want = (
+                        existing["ac_spl"],
+                        existing.get("ac_sppt", existing.get("sppt", DEFAULT_SETTINGS["sppt"])),
+                        existing.get("ac_fppt", existing.get("fppt", DEFAULT_SETTINGS["fppt"])),
+                    )
 
-        result = await loop.run_in_executor(None, _apply_limits, apply_spl, apply_sppt, apply_fppt)
+            result = _apply_limits(*want)
+            if not result["success"]:
+                return result
 
-        if result["success"]:
             s = _load_settings()
             if app_id:
                 existing.update({"spl": spl, "sppt": sppt, "fppt": fppt})
@@ -966,39 +1039,34 @@ class Plugin:
                 _save_profiles(profiles)
                 decky.logger.info(f"[legotdp] Saved game profile: app={app_id}")
             else:
-                s["spl"]  = spl
-                s["sppt"] = sppt
-                s["fppt"] = fppt
+                s["spl"], s["sppt"], s["fppt"] = spl, sppt, fppt
                 s["active_preset"] = preset_name
-            _save_active(s, apply_spl, apply_sppt, apply_fppt)
-
-        return result
+            _save_active(s, *want)
+            return result
+        return await _offload(_do)
 
     # ---- Updates ----------------------------------------------------- #
 
     async def check_for_updates(self) -> dict:
-        return await asyncio.get_running_loop().run_in_executor(None, updater.check)
+        return await _offload(updater.check)
 
     async def perform_update(self, download_url: str, asset_name: str) -> dict:
-        return await asyncio.get_running_loop().run_in_executor(
-            None, updater.download, download_url, asset_name)
+        return await _offload(updater.download, download_url, asset_name)
 
     async def _info_loop(self):
-        loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(2)
             if _panel_active:
                 try:
-                    await loop.run_in_executor(None, _refresh_info_cache)
+                    await _offload(_refresh_info_cache)
                 except Exception as e:
                     decky.logger.warning(f"[legotdp] info loop error: {e}")
 
     async def _enforce_loop(self):
-        loop = asyncio.get_running_loop()
         while True:
             await asyncio.sleep(5)
             try:
-                await loop.run_in_executor(None, _check_and_enforce)
+                await _offload(_check_and_enforce)
             except Exception as e:
                 decky.logger.warning(f"[legotdp] enforce iteration failed: {e}")
 
@@ -1006,25 +1074,24 @@ class Plugin:
         decky.logger.info(f"[legotdp] startup  v{updater.plugin_version()}")
         try:
             global _current_ac_online
-            loop = asyncio.get_running_loop()
             # Before anything reads settings: lifts the pre-1.5.0 files out of the
             # plugin directory, which the next reinstall would have deleted.
-            await loop.run_in_executor(None, _migrate)
+            await _offload(_migrate)
             # Resolve the trust store now so the log states up front whether downloads
             # and update checks will be able to verify certificates.
-            await loop.run_in_executor(None, updater.ssl_context)
+            await _offload(updater.ssl_context)
             # Seed this so the first enforce pass does not report a phantom AC change.
-            _current_ac_online = await loop.run_in_executor(None, _get_ac_online)
-            wmi = await loop.run_in_executor(None, _wmi_caps)
+            _current_ac_online = await _offload(_get_ac_online)
+            wmi = await _offload(_wmi_caps)
             try:
-                await loop.run_in_executor(None, _ensure_ryzenadj)
+                await _offload(_ensure_ryzenadj)
             except Exception as e:
                 # Only fatal when there is no firmware path to fall back on.
                 if not wmi:
                     raise
                 decky.logger.warning(
                     f"[legotdp] ryzenadj unavailable ({e}); Extras range disabled")
-            self._ready = True
+            Plugin._ready = True
             # Keep references - a bare create_task() may be garbage-collected mid-run.
             self._tasks = [
                 asyncio.create_task(self._enforce_loop()),
@@ -1033,19 +1100,29 @@ class Plugin:
             decky.logger.info(
                 f"[legotdp] ready (wmi={'yes' if wmi else 'no'}, "
                 f"ryzenadj={'yes' if os.path.isfile(BIN_PATH) else 'no'})")
-            s = _load_settings()
-            if s.get("enabled", True):
-                spl  = s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"]))
-                sppt = s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"]))
-                fppt = s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"]))
-                await loop.run_in_executor(None, _apply_limits, spl, sppt, fppt)
+
+            def _apply_saved() -> None:
+                s = _load_settings()
+                if s.get("enabled", True):
+                    _apply_limits(
+                        s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
+                        s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
+                        s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+                    )
+            await _offload(_apply_saved)
         except Exception as e:
-            self._setup_error = str(e)
+            Plugin._setup_error = str(e)
             decky.logger.error(f"[legotdp] setup failed: {e}")
 
     async def _unload(self):
         for t in self._tasks:
             t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        self._tasks = []
         decky.logger.info("[legotdp] unloaded")
 
     # Decky calls these around system sleep on loader versions that support them.
@@ -1056,12 +1133,14 @@ class Plugin:
 
     async def _resume(self):
         decky.logger.info("[legotdp] resumed, re-applying limits")
-        s = _load_settings()
-        if not s.get("enabled", True):
-            return
-        want = _clamp_triplet(
-            s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
-            s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
-            s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
-        )
-        await asyncio.get_running_loop().run_in_executor(None, _apply_limits, *want)
+
+        def _do() -> None:
+            s = _load_settings()
+            if not s.get("enabled", True):
+                return
+            _apply_limits(*_clamp_triplet(
+                s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
+                s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
+                s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+            ))
+        await _offload(_do)

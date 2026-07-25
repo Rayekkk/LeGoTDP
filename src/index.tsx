@@ -26,7 +26,8 @@ interface Caps   { spl: number; sppt: number; fppt: number }
 
 const OFFSET_MAX = { sppt: 10, fppt: 15 };
 
-// Used until get_caps() answers; the backend reports the firmware's real ceilings.
+// Used until get_caps() answers; the backend reports the firmware's real ceilings
+// and falls back to these same numbers (FALLBACK_STD_W in main.py) if it cannot.
 const FALLBACK_STD: Caps = { spl: 35, sppt: 37, fppt: 45 };
 const FALLBACK_MAX: Caps = { spl: 50, sppt: 50, fppt: 50 };
 const FALLBACK_MIN = 5;
@@ -554,6 +555,7 @@ const Content: FC = () => {
   const visible = useQuickAccessVisible();
 
   const autoAppliedRef = useRef<string | null>(null);
+  const noGameSyncedRef = useRef(false);
   const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => () => { if (statusTimerRef.current) clearTimeout(statusTimerRef.current); }, []);
@@ -668,6 +670,7 @@ const Content: FC = () => {
     if (!enabled) {
       if (perGame) setPerGame(false);
       autoAppliedRef.current = null;
+      noGameSyncedRef.current = false;
       return;
     }
 
@@ -675,6 +678,11 @@ const Content: FC = () => {
       const wasInGame = autoAppliedRef.current !== null;
       if (perGame) setPerGame(false);
       autoAppliedRef.current = null;
+      // setPerGame above re-runs this effect (perGame is a dependency), and
+      // without this the whole no-game branch ran twice per game exit - a
+      // second getSettings for a state we had already adopted.
+      if (noGameSyncedRef.current) return;
+      noGameSyncedRef.current = true;
       setSavedPreset(undefined);
       setSavedAcPreset(undefined);
       setAcSeparate(false);
@@ -697,6 +705,7 @@ const Content: FC = () => {
       return;
     }
 
+    noGameSyncedRef.current = false;
     if (autoAppliedRef.current === game.appId) return;
     autoAppliedRef.current = game.appId;
 

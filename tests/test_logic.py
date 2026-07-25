@@ -220,6 +220,79 @@ class RyzenadjOutput(unittest.TestCase):
         self.assertEqual(main._parse_ryzenadj_output(""), {})
 
 
+class LimitsCache(unittest.TestCase):
+    """The ryzenadj read spawns a process and the enforce loop asks every 5 s."""
+
+    INFO = ("| STAPM LIMIT    | 15.000 | stapm limit |\n"
+            "| PPT LIMIT SLOW | 18.000 | slow limit  |\n"
+            "| PPT LIMIT FAST | 25.000 | fast limit  |\n")
+
+    def setUp(self):
+        seed(FIXTURE)
+        main._last_source = "ryzenadj"      # force the expensive path
+        main._invalidate_limits_cache()
+        self._real_run = main._run_ryzenadj
+        self.info_calls = 0
+
+        def fake(args, timeout=5.0):
+            if "--info" in args:
+                self.info_calls += 1
+                return 0, self.INFO, ""
+            return 0, "", ""                # an apply
+        main._run_ryzenadj = fake
+
+    def tearDown(self):
+        main._run_ryzenadj = self._real_run
+        main._last_source = ""
+        main._invalidate_limits_cache()
+
+    def test_the_first_read_spawns_and_parses(self):
+        self.assertEqual(main._read_limits()["spl_limit"], 15.0)
+        self.assertEqual(self.info_calls, 1)
+
+    def test_a_second_read_is_served_from_the_cache(self):
+        main._read_limits()
+        self.assertEqual(main._read_limits()["spl_limit"], 15.0)
+        self.assertEqual(self.info_calls, 1)
+
+    def test_an_apply_drops_the_cache(self):
+        # Otherwise the panel would keep showing the old limits for 15 seconds
+        # after the user changed them.
+        main._read_limits()
+        self.assertTrue(main._apply_limits(15000, 18000, 25000)["success"])
+        main._read_limits()
+        self.assertEqual(self.info_calls, 2)
+
+    def test_a_failed_read_is_not_cached(self):
+        main._run_ryzenadj = lambda args, timeout=5.0: (-1, "", "boom")
+        self.assertEqual(main._read_limits(), {})
+        self.assertEqual(main._read_limits(), {})
+
+
+class RaplDiscovery(unittest.TestCase):
+    def setUp(self):
+        self._dir, self._ts = main._rapl_dir, main._rapl_probed_at
+
+    def tearDown(self):
+        main._rapl_dir, main._rapl_probed_at = self._dir, self._ts
+
+    def test_a_miss_is_retried_rather_than_remembered_forever(self):
+        # powercap can register after the plugin starts; caching the miss left
+        # the package draw blank until the plugin was reloaded.
+        main._rapl_dir, main._rapl_probed_at = None, 0.0
+        self.assertIsNone(main._find_rapl_package())
+        self.assertEqual(main._rapl_dir, "")
+        main._rapl_probed_at -= main._RAPL_RESCAN_S + 1
+        probed_before = main._rapl_probed_at
+        main._find_rapl_package()
+        self.assertGreater(main._rapl_probed_at, probed_before)
+
+    def test_a_hit_is_cached(self):
+        main._rapl_dir, main._rapl_probed_at = "/sys/class/powercap/fake:0", 0.0
+        self.assertEqual(main._find_rapl_package(), "/sys/class/powercap/fake:0")
+        self.assertEqual(main._rapl_probed_at, 0.0)   # no rescan
+
+
 class UpdateUrlValidation(unittest.TestCase):
     """The plugin runs as root and executes what it downloads."""
 

@@ -493,8 +493,14 @@ class StaleInfoCache(unittest.TestCase):
         for name in ("_info_cache_ts", "_applied_at", "_panel_active",
                      "_panel_active_ts", "_last_source"):
             self.addCleanup(setattr, main, name, getattr(main, name))
+        # _wmi_profile_lost reads the real platform-profile node, so on a Legion
+        # it can force a re-apply and fail this for reasons that have nothing to
+        # do with the cache under test. Stubbed so the suite means the same
+        # thing on a dev box, a CI runner and the device itself.
         self._restore = {n: getattr(main, n) for n in
-                         ("_apply_limits", "_read_limits", "_wmi_limits_overridden")}
+                         ("_apply_limits", "_read_limits", "_wmi_limits_overridden",
+                          "_wmi_profile_lost")}
+        main._wmi_profile_lost = lambda: False
         self.addCleanup(lambda: [setattr(main, n, v)
                                  for n, v in self._restore.items()])
         self.reads = 0
@@ -547,10 +553,13 @@ class WmiCrossCheck(unittest.TestCase):
 
     def setUp(self):
         self._run, self._isfile = main._run_ryzenadj, os.path.isfile
-        main._wmi_verified_at = 0.0
+        # None is the "never checked" sentinel. Zero is not: time.monotonic()
+        # counts from boot, so on a freshly started machine - a CI runner, say -
+        # zero is a few seconds ago and the check rate-limits itself away.
+        main._wmi_verified_at = None
         self.addCleanup(setattr, main, "_run_ryzenadj", self._run)
         self.addCleanup(setattr, os.path, "isfile", self._isfile)
-        self.addCleanup(setattr, main, "_wmi_verified_at", 0.0)
+        self.addCleanup(setattr, main, "_wmi_verified_at", None)
         os.path.isfile = lambda path: True
 
     def _live(self, sppt, fppt, rc=0):
@@ -564,6 +573,14 @@ class WmiCrossCheck(unittest.TestCase):
     def test_matching_limits_are_left_alone(self):
         self._live(30.0, 35.0)
         self.assertFalse(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_the_first_check_runs_however_long_the_machine_has_been_up(self):
+        # The regression: with a 0.0 sentinel this returned False on any machine
+        # whose uptime was under _WMI_VERIFY_EVERY_S, so a console that had just
+        # booted skipped its first cross-check entirely.
+        self._live(15.0, 15.0)
+        self.assertIsNone(main._wmi_verified_at)
+        self.assertTrue(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
 
     def test_the_check_is_rate_limited(self):
         self._live(15.0, 15.0)

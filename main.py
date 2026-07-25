@@ -641,7 +641,12 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
 # correctly, so it can serve as a cross-check. Sparingly: it spawns a process,
 # which is the cost the limits cache exists to avoid in the first place.
 _WMI_VERIFY_EVERY_S = 30.0
-_wmi_verified_at: float = 0.0
+# None, not 0.0. time.monotonic() counts from boot, so on a machine that has
+# only just started 0.0 is a timestamp a few seconds in the past rather than
+# "never" - which skipped the first cross-check for the first half minute of
+# uptime. Invisible on a dev box or a console that has been on for hours; CI
+# runs on a freshly booted runner and caught it immediately.
+_wmi_verified_at: float | None = None
 
 
 def _wmi_limits_overridden(want_w: tuple) -> bool:
@@ -655,7 +660,7 @@ def _wmi_limits_overridden(want_w: tuple) -> bool:
     if not os.path.isfile(BIN_PATH):
         return False
     now = time.monotonic()
-    if now - _wmi_verified_at < _WMI_VERIFY_EVERY_S:
+    if _wmi_verified_at is not None and now - _wmi_verified_at < _WMI_VERIFY_EVERY_S:
         return False
     _wmi_verified_at = now
 

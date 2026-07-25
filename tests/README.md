@@ -30,6 +30,19 @@ ssh deck@<legion> 'cd /tmp/legotdp-tests && sudo python3 -m unittest discover -s
 and the platform profile node are root-only, exactly as they are for the plugin
 itself.
 
+**Stop the plugin first.** `test_device.py` sets real limits and reads them back,
+and a running plugin defends its own target every five seconds - the two fight
+and the results are random:
+
+```bash
+sudo systemctl stop plugin_loader
+# ... run the tests ...
+sudo systemctl start plugin_loader
+```
+
+`test_logic.py` needs none of this; it touches no hardware and passes with or
+without `/sys` present.
+
 To exercise the copy DeckyLoader actually loaded rather than a fresh checkout,
 point the harness at it:
 

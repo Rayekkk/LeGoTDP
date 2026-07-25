@@ -5,10 +5,14 @@ node_modules/
 __pycache__/
 *.pyc
 *.pyo
+.venv/
+venv/
 
 # Build output
 dist/
+build/
 *.zip
+*.tsbuildinfo
 
 # Plugin runtime
 settings.json
@@ -16,11 +20,20 @@ profiles.json
 bin/ryzenadj
 *.log
 
+# Editors
+.vscode/
+.idea/
+
+# Local secrets
+.env
+.env.*
+
 # OS
 .DS_Store
 Thumbs.db
 
 # Claude Code
+.claude/
 CLAUDE.md
 CHANGELOG.md
 release.md

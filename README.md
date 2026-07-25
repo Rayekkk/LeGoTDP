@@ -109,14 +109,12 @@ with the standard range.
 
 ---
 
----
+## Credits
 
-## Third-party
-
-This plugin downloads and uses [ryzenadj](https://github.com/FlyGoat/RyzenAdj) as an external binary, which is licensed under [LGPL-3.0](https://github.com/FlyGoat/RyzenAdj/blob/master/LICENSE).
+- [RyzenAdj](https://github.com/FlyGoat/RyzenAdj) by Jiaxun Yang and contributors, LGPL-3.0 — downloaded at runtime, not bundled; see [NOTICE](NOTICE)
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Third-party components are listed in [NOTICE](NOTICE).

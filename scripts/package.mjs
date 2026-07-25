@@ -37,6 +37,7 @@ const CONTENTS = [
   "package.json",
   "README.md",
   "LICENSE",
+  "NOTICE",
   "dist",
 ];
 

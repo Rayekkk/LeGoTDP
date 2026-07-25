@@ -1,13 +1,19 @@
 {
   "name": "LeGoTDP",
   "author": "Rayek",
-  "flags": ["root"],
+  "flags": [
+    "root"
+  ],
   "api_version": 2,
   "main": "main.py",
   "bin": "dist/index.js",
   "version": "1.4.0",
   "publish": {
-    "tags": ["utilities", "hardware", "performance"],
+    "tags": [
+      "utilities",
+      "hardware",
+      "performance"
+    ],
     "description": "Set AMD CPU TDP limits directly from the Steam overlay. Supports presets, custom sliders, per-game profiles, and live power draw monitoring on the Lenovo Legion Go 2.",
     "image": ""
   }

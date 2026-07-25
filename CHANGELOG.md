@@ -63,3 +63,58 @@ All notable changes to LeGoTDP, newest first.
 ### Fixed
 
 - Update downloads respect the system language. The ZIP is saved to your actual XDG download directory - `Scaricati`, `Téléchargements` and so on - instead of a hardcoded `Downloads` folder.
+
+## [1.3.1] - 2026-05-21
+
+### Fixed
+
+- The plugin failed to load after a fresh install. `package.json` is now included in the release ZIP; without it Decky Loader fell back to legacy script loading, which is incompatible with the ES module bundle, and showed a syntax error instead of the UI.
+
+## [1.3.0] - 2026-05-20
+
+### Added
+
+- Separate AC profile. Set independent TDP limits for battery and AC; the plugin switches automatically when the charger is plugged or unplugged. Works for both global settings and per-game profiles.
+- Extended TDP range. A new Extras section with an unlock toggle raises the Custom slider limits to 60 W for SPL, SPPT and FPPT, for advanced users.
+- The preset name is shown as a label below the preset buttons, so you always know which preset is active.
+
+### Fixed
+
+- The settings file is written atomically - to a temporary file, then replaced - to prevent corruption on an unexpected shutdown.
+- The ryzenadj lock now correctly serialises all hardware calls across the enforce and info loops.
+
+## [1.2.0] - 2026-05-18
+
+### Added
+
+- In-plugin update system. Check for updates and download the new version directly from the plugin menu.
+- The downloaded ZIP is saved to `~/Downloads`, with install instructions shown in the UI.
+
+## [1.1.0] - 2026-05-18
+
+### Added
+
+- Minimum preset (5/5/10 W).
+
+### Changed
+
+- The Live TDP panel only polls ryzenadj while the panel is visible.
+
+### Fixed
+
+- The device froze when opening or closing the Live TDP panel. ryzenadj calls are now handled entirely in the backend, decoupled from frontend IPC.
+
+## [1.0.0] - 2026-05-17
+
+Initial release. Requires a Lenovo Legion Go 2 (Ryzen Z2 Extreme) with DeckyLoader installed.
+
+### Added
+
+- SPL, SPPT and FPPT power limits, set via preset buttons or custom sliders.
+- Presets: Silent (8/10/15 W), Balanced (15/18/25 W), Performance (25/28/35 W), Max (35/37/45 W).
+- Per-game profiles, saved per Steam App ID and applied automatically in the background when a game launches, with no need to open the plugin menu.
+- Global settings restored automatically when a game exits.
+- Live TDP panel showing the current limits and real-time power draw via ryzenadj.
+- Drift enforcement, re-applying your settings every 5 seconds if the system overrides them.
+- Enable/disable toggle, restoring firmware defaults when turned off.
+- The ryzenadj binary is downloaded automatically on first run.

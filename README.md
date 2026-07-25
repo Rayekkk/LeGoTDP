@@ -37,8 +37,11 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 
 | Requirement | Details |
 |---|---|
-| Device | Lenovo Legion Go 2 |
-| Plugin loader | [DeckyLoader](https://github.com/SteamDeckHomebrew/decky-loader) |
+| Device | Lenovo Legion Go 2 (Ryzen Z2 Extreme / Strix Point) |
+| Firmware interface | `lenovo-wmi-other` under `/sys/class/firmware-attributes/` |
+| Plugin loader | [Decky Loader](https://decky.xyz) |
+
+> The extended TDP range additionally needs `ryzenadj`, which the plugin downloads on first run. Everything else works through the firmware alone.
 
 ---
 
@@ -46,20 +49,64 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 
 ### Easy install (recommended)
 
-1. Download the latest `LeGoTDP.zip` from the [Releases](../../releases) page.
-2. In DeckyLoader, open the settings and enable **Developer Mode**.
-3. In the Developer section, choose **Install Plugin from ZIP** and select the downloaded file.
+1. Install [Decky Loader](https://decky.xyz) if you haven't already.
+2. Download `LeGoTDP-x.x.x.zip` from the [Releases](../../releases) page.
+3. In Gaming Mode, open the **Quick Access Menu** (the `…` button).
+4. Open the Decky menu, scroll to the bottom, then **Developer** -> **Install Plugin from ZIP**.
+5. Select the downloaded zip.
+
+The zip contains a single `LeGoTDP` folder - Decky installs it automatically. Since 1.5.0 your settings and per-game profiles live in Decky's settings directory, so reinstalling keeps them.
 
 ### From source
 
-**Prerequisites:** Node.js >= 18, npm
+Requires Node.js 18+.
 
 ```bash
+git clone https://github.com/Rayekkk/LeGoTDP
+cd LeGoTDP
+
 npm install
-npm run build
+npm run build      # bundles src/index.tsx into dist/
+npm run package    # produces LeGoTDP-<version>.zip
 ```
 
-The built frontend lands in `dist/`. Copy the entire plugin directory to `~/homebrew/plugins/LeGoTDP/` and reload DeckyLoader.
+Then install the resulting zip through Decky's **Install Plugin from ZIP**, which is the supported path and avoids permission problems.
+
+To copy the files directly instead, install only the runtime payload - copying the whole checkout would drag in `.git/`, `src/` and `node_modules/`:
+
+```bash
+DEST=~/homebrew/plugins/LeGoTDP
+sudo mkdir -p "$DEST"
+sudo cp -r main.py updater.py plugin.json package.json README.md LICENSE NOTICE dist "$DEST"
+sudo systemctl restart plugin_loader
+```
+
+---
+
+## Usage
+
+Open the **Quick Access Menu** and tap the chip icon.
+
+**Enable**
+The master switch. Turning it off hands the platform profile back to the firmware and stops the enforce loop, so the device behaves as if the plugin were not installed.
+
+**Presets**
+Minimum, Silent, Balanced, Performance and Max apply immediately. The active one is marked with `>`. Picking **Custom** reveals the sliders.
+
+**Custom sliders**
+SPL is the main TDP dial. SPPT and FPPT are set as headroom *above* it, so raising the TDP carries the burst limits along. Both offsets shrink automatically as SPL approaches the ceiling, and press **Apply TDP** to commit.
+
+**Per Game Profile**
+Launch a game, then turn on **Per Game Profile**. Whatever you pick from that point on is stored against that game and applied automatically every time it runs - in the background, with the plugin menu closed. Turn the toggle off to delete the profile and fall back to the global settings.
+
+**Separate AC Profile**
+With a per-game profile on, this splits it into independent battery and charging limits. The buttons switch which one the sliders are editing, and the plugin swaps between them the moment the charger goes in or out.
+
+**Current TDP**
+Live limits plus package draw read from the RAPL energy counter. It only refreshes while the panel is on screen.
+
+**Extras**
+Unlocks the Custom sliders up to 50 W, applied through `ryzenadj` instead of the firmware. This overrides the manufacturer's safety limits - use at your own risk.
 
 ---
 
@@ -97,24 +144,93 @@ Live package draw comes from the RAPL energy counter under `/sys/class/powercap/
 the panel does not need to spawn a process to refresh.
 
 The Python backend runs an enforce loop every 5 seconds that:
-1. Detects running Steam games by scanning `/proc/*/environ` for `SteamAppId`
+1. Resolves the running Steam game. The frontend reports it from Steam's own Router,
+   which is authoritative; the backend falls back to scanning `/proc` for the Steam
+   reaper's `AppId=` argument when that value goes stale
 2. Applies a saved per-game profile automatically when a game launches
 3. Restores global settings when a game exits
 4. Re-applies settings if the system has overridden them (drift correction), giving up
    after a few attempts on targets the hardware silently refuses
 
+Settings and per-game profiles are persisted through Decky's `SettingsManager`, so they
+survive reinstalling the plugin. Installs from before 1.5.0 kept them inside the plugin
+directory; those files are migrated on the first start after the update.
+
 `ryzenadj` is fetched automatically from [FlyGoat/RyzenAdj](https://github.com/FlyGoat/RyzenAdj)
-GitHub releases on the first run. If that fails and WMI is available, the plugin still works
-with the standard range.
+GitHub releases on the first run, over https from a fixed allowlist of GitHub hosts. If that
+fails and WMI is available, the plugin still works with the standard range.
+
+---
+
+## Troubleshooting
+
+### Sliders move but the limits do not change
+
+```bash
+# Is the firmware interface there at all?
+ls /sys/class/firmware-attributes/lenovo-wmi-other-0/attributes/
+
+# The firmware only accepts ppt_* writes while this reads 'custom'
+cat /sys/class/platform-profile/*/profile
+
+# Plugin logs
+journalctl -u plugin_loader | grep legotdp | tail -30
+```
+
+If the platform profile keeps leaving `custom`, something else on the system is
+setting it - the plugin logs `platform profile left 'custom', re-asserting limits`
+and takes it back.
+
+### The log says a target is unreachable
+
+```
+target (35.0, 50.0, 50.0) unreachable after 3 attempts, accepting (...) and standing down
+```
+
+Expected. Some limits are capped by the SMU regardless of what is requested, so the
+plugin accepts whatever the hardware settled on rather than re-applying forever.
+
+### The Extras range does nothing
+
+```bash
+# Did the binary download?
+ls -l ~/homebrew/plugins/LeGoTDP/bin/ryzenadj
+
+# Does it run?
+sudo ~/homebrew/plugins/LeGoTDP/bin/ryzenadj --info
+```
+
+---
+
+## Development
+
+```bash
+npm run build       # bundle the frontend into dist/
+npm run watch       # rebuild on change
+npm run typecheck   # TypeScript check with no emit
+npm run package     # build the release zip
+
+python -m unittest discover -s tests -v   # backend tests, see tests/README.md
+```
+
+The frontend is built with [`@decky/rollup`](https://www.npmjs.com/package/@decky/rollup), the official Decky preset, which maps `react`, `react/jsx-runtime`, `react-dom` and `@decky/ui` onto the globals Steam injects rather than bundling them.
+
+`updater.py` is shared verbatim with [LeGo-Vibe-Control](https://github.com/Rayekkk/LeGo-Vibe-Control) - change it in one repo and copy it to the other.
+
+CI builds every push and pull request. Pushing a tag such as `1.5.0` builds the zip and publishes a GitHub release; the tag must match the `version` in both `plugin.json` and `package.json`.
 
 ---
 
 ## Credits
 
-- [RyzenAdj](https://github.com/FlyGoat/RyzenAdj) by Jiaxun Yang and contributors, LGPL-3.0 — downloaded at runtime, not bundled; see [NOTICE](NOTICE)
+- [RyzenAdj](https://github.com/FlyGoat/RyzenAdj) by Jiaxun Yang and contributors, LGPL-3.0 - downloaded at runtime, not bundled; see [NOTICE](NOTICE)
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party components are listed in [NOTICE](NOTICE).
+MIT - see [LICENSE](LICENSE). Third-party components are listed in [NOTICE](NOTICE).
+
+---
+
+*Vibe coded with the help of [Claude](https://claude.ai) 🤖*

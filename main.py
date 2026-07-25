@@ -625,6 +625,51 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
         _apply_lock.release()
 
 
+# The WMI attributes are the driver's record of its own writes, not a reading of
+# the hardware, so anything that moves the limits without going through that
+# interface leaves them reporting stale values and the enforce pass idle.
+# Measured on the device: with the plugin holding 25/30/35 through WMI, an
+# external drop to 15 W left the attributes still reporting 25/30/35, the panel
+# showing 25/30/35, and zero re-apply attempts.
+#
+# `ryzenadj --info` is a live read and does see WMI-applied slow and fast
+# correctly, so it can serve as a cross-check. Sparingly: it spawns a process,
+# which is the cost the limits cache exists to avoid in the first place.
+_WMI_VERIFY_EVERY_S = 30.0
+_wmi_verified_at: float = 0.0
+
+
+def _wmi_limits_overridden(want_w: tuple) -> bool:
+    """True when a live read disagrees with what the firmware claims is set.
+
+    Only SPPT and FPPT are compared. SPL cannot be read back through ryzenadj
+    on this hardware (see _adopt_unreadable_spl), and the firmware's own
+    reading of it is the thing under suspicion here.
+    """
+    global _wmi_verified_at
+    if not os.path.isfile(BIN_PATH):
+        return False
+    now = time.monotonic()
+    if now - _wmi_verified_at < _WMI_VERIFY_EVERY_S:
+        return False
+    _wmi_verified_at = now
+
+    if not _ryzenadj_lock.acquire(timeout=2.0):
+        return False
+    try:
+        rc, out, _ = _run_ryzenadj(["--info"], timeout=3.0)
+    finally:
+        _ryzenadj_lock.release()
+    if rc != 0:
+        return False
+
+    live = _parse_ryzenadj_output(out)
+    pairs = [(live.get("sppt_limit"), want_w[1]), (live.get("fppt_limit"), want_w[2])]
+    if any(v is None for v, _ in pairs):
+        return False
+    return any(abs(v - w) > DRIFT_TOLERANCE_WMI_W for v, w in pairs)
+
+
 def _wmi_profile_lost() -> bool:
     """True when the last apply was via WMI but the platform profile is no longer
     'custom', so the ppt_* attributes still read the old values yet no longer bind.
@@ -885,13 +930,23 @@ def _enforce_target(want: tuple) -> None:
     tolerance = DRIFT_TOLERANCE_WMI_W if _last_source == "wmi" else DRIFT_TOLERANCE_RYZENADJ_W
     # The WMI attributes keep reporting the last value even after the profile leaves
     # 'custom', so a matching read is not proof the limit is actually enforced - force
-    # a re-apply (which re-selects custom) when we detect that.
+    # a re-apply (which re-selects custom) when we detect that. For the same reason
+    # a matching read is no proof nobody else moved the limits, hence the live
+    # cross-check; both make `cur` unreliable rather than merely stale.
     profile_lost = _wmi_profile_lost()
-    if not profile_lost and all(abs(c - r) <= tolerance for c, r in zip(cur, reference)):
+    overridden = _last_source == "wmi" and _wmi_limits_overridden(want_w)
+    if not (profile_lost or overridden) \
+            and all(abs(c - r) <= tolerance for c, r in zip(cur, reference)):
         return
 
     if profile_lost:
         decky.logger.info("[legotdp] platform profile left 'custom', re-asserting limits")
+        _drift_settled, _drift_attempts = (), 0
+
+    if overridden:
+        decky.logger.info(
+            "[legotdp] a live read disagrees with the firmware attributes, "
+            "something moved the limits behind us - re-asserting")
         _drift_settled, _drift_attempts = (), 0
 
     if _drift_settled:

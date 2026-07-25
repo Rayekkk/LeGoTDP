@@ -483,6 +483,69 @@ class UnreadableSpl(unittest.TestCase):
                              for c, w in zip(cur, want_w)))
 
 
+class WmiCrossCheck(unittest.TestCase):
+    """The firmware attributes only record what was written through them, so an
+    override that bypasses that interface is invisible there. Measured on the
+    device: an external drop to 15 W left them reporting 25/30/35 and the
+    enforce pass idle. A live read is the only way to notice."""
+
+    LIVE = """
+| STAPM LIMIT             |   35.000  | stapm limit |
+| PPT LIMIT FAST          |   {fppt}  | fast limit  |
+| PPT LIMIT SLOW          |   {sppt}  | slow limit  |
+"""
+
+    def setUp(self):
+        self._run, self._isfile = main._run_ryzenadj, os.path.isfile
+        main._wmi_verified_at = 0.0
+        self.addCleanup(setattr, main, "_run_ryzenadj", self._run)
+        self.addCleanup(setattr, os.path, "isfile", self._isfile)
+        self.addCleanup(setattr, main, "_wmi_verified_at", 0.0)
+        os.path.isfile = lambda path: True
+
+    def _live(self, sppt, fppt, rc=0):
+        text = self.LIVE.format(sppt=f"{sppt:.3f}", fppt=f"{fppt:.3f}")
+        main._run_ryzenadj = lambda args, timeout=5.0: (rc, text, "")
+
+    def test_an_override_is_noticed(self):
+        self._live(15.0, 15.0)
+        self.assertTrue(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_matching_limits_are_left_alone(self):
+        self._live(30.0, 35.0)
+        self.assertFalse(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_the_check_is_rate_limited(self):
+        self._live(15.0, 15.0)
+        self.assertTrue(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+        # Spawning a process on every five-second pass is the cost the limits
+        # cache was added to avoid; once per _WMI_VERIFY_EVERY_S is the budget.
+        self.assertFalse(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+        main._wmi_verified_at -= main._WMI_VERIFY_EVERY_S + 1
+        self.assertTrue(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_a_missing_binary_is_not_an_override(self):
+        os.path.isfile = lambda path: False
+        self._live(15.0, 15.0)
+        self.assertFalse(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_a_failed_read_is_not_an_override(self):
+        # Better to leave the limits alone than to bounce the platform profile
+        # on the strength of a reading we never got.
+        self._live(15.0, 15.0, rc=-1)
+        self.assertFalse(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_an_unparsable_read_is_not_an_override(self):
+        main._run_ryzenadj = lambda args, timeout=5.0: (0, "nothing useful", "")
+        self.assertFalse(main._wmi_limits_overridden((25.0, 30.0, 35.0)))
+
+    def test_spl_disagreement_alone_never_triggers(self):
+        # STAPM is unreadable on this hardware, so it must not be able to drive
+        # a re-apply on its own - that is the loop we just stopped chasing.
+        self._live(30.0, 35.0)
+        self.assertFalse(main._wmi_limits_overridden((5.0, 30.0, 35.0)))
+
+
 class RaplDiscovery(unittest.TestCase):
     def setUp(self):
         self._dir, self._ts = main._rapl_dir, main._rapl_probed_at

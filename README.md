@@ -14,7 +14,7 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 - **Per-game profiles** - automatically applied in the background when a game launches, no need to open the plugin menu
 - **Separate AC profile** - set independent TDP limits for battery and charging; switches automatically when AC state changes
 - **Live TDP panel** - shows current limits plus real-time package draw read from RAPL
-- **Drift enforcement** - re-applies your settings every 5 seconds if the system overrides them, and stands down on targets the hardware refuses
+- **Drift enforcement** - re-applies your settings every 5 seconds if the system overrides them, cross-checks against a live reading twice a minute so an override that bypasses the firmware interface cannot hide, and stands down on targets the hardware refuses
 - **Enable/disable toggle** - hands the platform profile back to the firmware when turned off
 - **Extended TDP range** - Extras section unlocks Custom sliders up to 50 W (advanced users, use at your own risk)
 - Auto-downloads a pre-built `ryzenadj` binary on first run (only needed for the extended range)

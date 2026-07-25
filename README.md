@@ -105,6 +105,24 @@ With a per-game profile on, this splits it into independent battery and charging
 **Current TDP**
 Live limits plus package draw read from the RAPL energy counter. It only refreshes while the panel is on screen.
 
+**Uninstalling**
+Turn the **Enable** toggle off first. That hands the platform profile back to the
+firmware there and then, which is the only way to be sure of it.
+
+The plugin also does this from its `_uninstall()` hook, but the hook is not
+guaranteed to run: Decky writes the "you are being uninstalled" message to the
+plugin and sends SIGTERM within a second, without waiting for the plugin to read
+it, so the shutdown can start first and skip the hook. Observed on a Legion Go 2
+with decky-loader 3.2.7-pre1, and not something the plugin can influence. If you
+uninstall without turning the plugin off, check with:
+
+```bash
+cat /sys/class/platform-profile/platform-profile-*/profile
+```
+
+If one of them still reads `custom`, the firmware is still holding the plugin's
+last TDP. Write `balanced` to it to hand control back.
+
 **Extras**
 Unlocks the Custom sliders up to 50 W, applied through `ryzenadj` instead of the firmware. This overrides the manufacturer's safety limits - use at your own risk.
 

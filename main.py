@@ -1318,11 +1318,15 @@ class Plugin:
     async def _unload(self):
         for t in self._tasks:
             t.cancel()
-        for t in self._tasks:
-            try:
-                await t
-            except asyncio.CancelledError:
-                pass
+        # Bounded on purpose. Cancelling a task parked in run_in_executor does
+        # not stop the worker thread, so awaiting it takes as long as whatever
+        # blocking call it sits inside - a `ryzenadj --info` plus its lock wait
+        # is five seconds on its own. The loader gives a plugin exactly five
+        # seconds to stop before it sends SIGKILL, and a SIGKILL means
+        # _uninstall() never runs at all. Observed on the device: the platform
+        # profile was left pinned to 'custom' with the plugin already gone.
+        if self._tasks:
+            await asyncio.wait(self._tasks, timeout=1.0)
         self._tasks = []
         decky.logger.info("[legotdp] unloaded")
 

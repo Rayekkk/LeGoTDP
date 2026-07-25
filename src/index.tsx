@@ -9,6 +9,7 @@ import {
 import {
   ButtonItem,
   Field,
+  findModuleExport,
   PanelSection,
   PanelSectionRow,
   Router,
@@ -246,6 +247,54 @@ const styles = {
   },
 };
 
+// ── Resume from suspend ────────────────────────────────────────────────────────
+
+/**
+ * Subscribe to resume-from-suspend. Returns an unsubscribe function, or null
+ * when the client offers no way to hear about it.
+ *
+ * `SteamClient.System.RegisterForOnResumeFromSuspend` was removed from the
+ * Steam client in the September 2025 beta. Optional chaining meant calling it
+ * silently did nothing - confirmed on the device, where two suspend cycles
+ * produced no callback and no error, and the limits only came back five
+ * seconds later when the enforce loop noticed. The replacement lives on a
+ * SleepManager module, reachable either as a global or through the webpack
+ * exports; the legacy call stays as a fallback for older clients.
+ */
+function onResumeFromSuspend(handler: () => void): (() => void) | null {
+  const asUnsub = (reg: any): (() => void) | null => {
+    if (typeof reg === "function") return reg;
+    if (typeof reg?.unregister === "function") return () => reg.unregister();
+    return null;
+  };
+  const isSleepManager = (e: any) =>
+    !!e && typeof e === "object" &&
+    (typeof e.RegisterForNotifyResumeFromSuspend === "function" ||
+      typeof e.NotifyResumeFromSuspend === "function");
+
+  try {
+    const mgr = (window as any).SleepManager ?? findModuleExport(isSleepManager);
+    const unsub = asUnsub(mgr?.RegisterForNotifyResumeFromSuspend?.(handler));
+    if (unsub) return unsub;
+  } catch (e) {
+    console.warn("[legotdp] SleepManager lookup failed", e);
+  }
+
+  try {
+    const unsub = asUnsub(
+      (window as any).SteamClient?.System?.RegisterForOnResumeFromSuspend?.(handler));
+    if (unsub) return unsub;
+  } catch (e) {
+    console.warn("[legotdp] legacy resume registration failed", e);
+  }
+
+  // Said out loud rather than swallowed: this going quiet again is exactly how
+  // the previous registration rotted unnoticed.
+  console.warn("[legotdp] no resume-from-suspend notification available; "
+    + "limits will be restored by the enforce loop instead");
+  return null;
+}
+
 // ── Running app watcher ────────────────────────────────────────────────────────
 
 type GameListener = (game: RunningGame | null) => void;
@@ -315,22 +364,18 @@ class AppWatcher {
       console.warn("[legotdp] app lifetime notifications unavailable", e);
     }
 
-    try {
-      const reg = steam?.System?.RegisterForOnResumeFromSuspend?.(() => {
-        // The SMU comes back at firmware defaults after sleep. Decky has no
-        // backend resume hook - the loader only calls _migration, _main,
-        // _unload and _uninstall - so this notification is the only way to
-        // beat the enforce loop's five-second tick to it.
-        void reapply()
-          .then((res) => {
-            if (!res.success) console.warn("[legotdp] reapply after resume failed");
-          })
-          .catch((e) => console.error("[legotdp] reapply after resume threw", e));
-      });
-      if (reg?.unregister) this.unsubs.push(() => reg.unregister());
-    } catch (e) {
-      console.warn("[legotdp] resume notifications unavailable", e);
-    }
+    // The SMU comes back at firmware defaults after sleep. Decky has no backend
+    // resume hook - the loader only calls _migration, _main, _unload and
+    // _uninstall - so this notification is the only way to beat the enforce
+    // loop's five-second tick to it.
+    const offResume = onResumeFromSuspend(() => {
+      void reapply()
+        .then((res) => {
+          if (!res.success) console.warn("[legotdp] reapply after resume failed");
+        })
+        .catch((e) => console.error("[legotdp] reapply after resume threw", e));
+    });
+    if (offResume) this.unsubs.push(offResume);
 
     this.timer = setInterval(() => void this.check(), 2000);
     void this.check();

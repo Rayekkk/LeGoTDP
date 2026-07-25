@@ -131,11 +131,28 @@ class PluginApi(RestoresLimits, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile["profile"]["spl"], 25000)
         await self.plugin.delete_game_profile("9999")
 
-    async def test_resume_reapplies_the_active_limits(self):
+    async def test_reapply_restores_the_active_limits(self):
+        # Stands in for resume from suspend, where the SMU comes back at firmware
+        # defaults. Driven from the frontend off Steam's notification: Decky has
+        # no backend resume hook to test through.
         await self.plugin.apply_tdp(15000, 18000, 25000, "", "balanced")
         main._apply_wmi(30, 30, 30)         # something external moves them
-        await self.plugin._resume()
+        result = await self.plugin.reapply()
+        self.assertTrue(result["success"])
+        self.assertFalse(result["skipped"])
         self.assertEqual(main._read_limits()["spl_limit"], 15)
+
+    async def test_reapply_does_nothing_while_disabled(self):
+        await self.plugin.apply_tdp(15000, 18000, 25000, "", "balanced")
+        await self.plugin.set_plugin_enabled(False)
+        try:
+            main._apply_wmi(30, 30, 30)
+            self.assertTrue((await self.plugin.reapply())["skipped"])
+            # Left where it was: a disabled plugin has no business touching the
+            # hardware just because the machine woke up.
+            self.assertEqual(main._read_limits()["spl_limit"], 30)
+        finally:
+            await self.plugin.set_plugin_enabled(True)
 
 
 if __name__ == "__main__":

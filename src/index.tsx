@@ -1,4 +1,11 @@
-import { callable, definePlugin, toaster, useQuickAccessVisible } from "@decky/api";
+import {
+  addEventListener,
+  callable,
+  definePlugin,
+  removeEventListener,
+  toaster,
+  useQuickAccessVisible,
+} from "@decky/api";
 import {
   ButtonItem,
   Field,
@@ -134,6 +141,7 @@ interface TdpValues  {
   source?: string;
 }
 interface TdpInfo     { success: boolean; values: TdpValues; error?: string }
+interface PowerSource { ac: boolean }
 interface GameProfile {
   exists: boolean;
   profile: { spl: number; sppt: number; fppt: number; preset?: string };
@@ -165,7 +173,8 @@ const setPluginEnabled  = callable<[boolean], void>("set_plugin_enabled");
 const restoreDefaults   = callable<[], TdpResult>("restore_defaults");
 const setPanelActive    = callable<[boolean], void>("set_panel_active");
 const setActiveApp      = callable<[string], void>("set_active_app");
-const getPowerSource    = callable<[], { ac: boolean }>("get_power_source");
+const getPowerSource    = callable<[], PowerSource>("get_power_source");
+const reapply           = callable<[], { success: boolean; skipped?: boolean }>("reapply");
 const setGameAcProfile  = callable<[string, number, number, number, boolean, string], { success: boolean; stderr?: string }>("set_game_ac_profile");
 const getExtrasUnlocked = callable<[], boolean>("get_extras_unlocked");
 const setExtrasUnlockedCall = callable<[boolean], void>("set_extras_unlocked");
@@ -306,6 +315,23 @@ class AppWatcher {
       console.warn("[legotdp] app lifetime notifications unavailable", e);
     }
 
+    try {
+      const reg = steam?.System?.RegisterForOnResumeFromSuspend?.(() => {
+        // The SMU comes back at firmware defaults after sleep. Decky has no
+        // backend resume hook - the loader only calls _migration, _main,
+        // _unload and _uninstall - so this notification is the only way to
+        // beat the enforce loop's five-second tick to it.
+        void reapply()
+          .then((res) => {
+            if (!res.success) console.warn("[legotdp] reapply after resume failed");
+          })
+          .catch((e) => console.error("[legotdp] reapply after resume threw", e));
+      });
+      if (reg?.unregister) this.unsubs.push(() => reg.unregister());
+    } catch (e) {
+      console.warn("[legotdp] resume notifications unavailable", e);
+    }
+
     this.timer = setInterval(() => void this.check(), 2000);
     void this.check();
   }
@@ -370,19 +396,24 @@ const LivePanel: FC = () => {
 
   // Gated on visibility, not just on mount: the panel stays mounted while the
   // Quick Access Menu is on another tab, and refreshing it there costs a RAPL
-  // read and an RPC round trip every two seconds for nobody to look at.
+  // read every two seconds for nobody to look at. set_panel_active is what
+  // gates the backend loop, so nothing is computed while this is unmounted.
+  //
+  // The backend pushes each refresh rather than answering a poll: it already
+  // recomputed these numbers on exactly this cadence, so asking for them over
+  // RPC was a round trip to be handed something that already existed.
   useEffect(() => {
     if (!visible) return;
     let active = true;
     setPanelActive(true);
-    const refresh = async () => {
-      try { if (active) setInfo(await getTdpInfo()); } catch (_) {}
-    };
-    refresh();
-    const id = setInterval(refresh, 2000);
+    const onInfo = (next: TdpInfo) => { if (active) setInfo(next); };
+    addEventListener<[TdpInfo]>("tdp_info", onInfo);
+    // Seed it: the first push is a full interval away, and the panel would
+    // otherwise show a spinner for two seconds every time it is opened.
+    getTdpInfo().then((v) => { if (active) setInfo(v); }).catch(() => undefined);
     return () => {
       active = false;
-      clearInterval(id);
+      removeEventListener<[TdpInfo]>("tdp_info", onInfo);
       setPanelActive(false);
     };
   }, [visible]);
@@ -646,21 +677,22 @@ const Content: FC = () => {
     return AppWatcher.listen(setGame);
   }, []);
 
-  // ── AC polling ────────────────────────────────────────────────────────────────
-  // Only while the panel is on screen. The backend's own enforce loop reacts to
-  // an AC change on its own; this poll exists purely to keep the label honest.
+  // ── AC state ──────────────────────────────────────────────────────────────────
+  // The enforce loop already reads the charger every five seconds to decide
+  // which profile applies, and now emits when the answer changes - so the panel
+  // subscribes instead of running its own three-second poll. The one read on
+  // open seeds the label, since an event only fires on a change and the last one
+  // may have happened while the panel was shut.
   useEffect(() => {
     if (!ready || !visible) return;
     let active = true;
-    const poll = async () => {
-      try {
-        const ps = await getPowerSource();
-        if (active) setAcOnline(ps.ac);
-      } catch (_) {}
+    const onPower = (ps: PowerSource) => { if (active) setAcOnline(ps.ac); };
+    addEventListener<[PowerSource]>("power_source", onPower);
+    getPowerSource().then((ps) => { if (active) setAcOnline(ps.ac); }).catch(() => undefined);
+    return () => {
+      active = false;
+      removeEventListener<[PowerSource]>("power_source", onPower);
     };
-    poll();
-    const id = setInterval(poll, 3000);
-    return () => { active = false; clearInterval(id); };
   }, [ready, visible]);
 
   // ── Auto-apply game profile when game / ready / enabled changes ──────────────

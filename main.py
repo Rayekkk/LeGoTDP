@@ -165,8 +165,11 @@ async def _offload(fn, *args):
     """Run blocking work off the event loop.
 
     Settings I/O, sysfs reads and waiting on _settings_lock or _apply_lock all
-    block. Decky runs every plugin on one shared event loop, so a handler that
-    blocks here stalls the whole loader.
+    block. Decky gives each plugin its own process and loop, so blocking here
+    does not stall other plugins - it stalls this one: every RPC the panel sends
+    queues behind it, and neither the enforce loop nor the info loop ticks until
+    it returns. _apply_lock alone can be held for a profile bounce plus three
+    firmware writes.
     """
     return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
@@ -735,17 +738,24 @@ def _apply_and_record(spl: int, sppt: int, fppt: int, why: str) -> None:
             f"rc={result['returncode']} err={result['stderr']}")
 
 
-def _check_and_enforce() -> None:
+def _check_and_enforce() -> dict:
+    """One enforce pass.
+
+    Returns the events the caller should emit. This runs in an executor thread,
+    which cannot await decky.emit itself, so the async loop above does the
+    emitting - that is what lets the panel stop polling for the charger state.
+    """
     global _current_game_id, _current_ac_online
 
     s = _load_settings()
     if not s.get("enabled", True):
-        return
+        return {}
 
     appid    = _get_running_appid()
     ac_now   = _get_ac_online()
     ac_changed = ac_now != _current_ac_online
     _current_ac_online = ac_now
+    events = {"power_source": {"ac": ac_now}} if ac_changed else {}
 
     game_changed = appid != _current_game_id
 
@@ -758,7 +768,7 @@ def _check_and_enforce() -> None:
             trigger = "AC state change" if ac_changed else "game launch"
             _apply_and_record(*_pick_profile_values(profile, ac_now),
                               f"game profile for app={appid} on {trigger} (ac={ac_now})")
-            return
+            return events
 
         # Nothing per-game applies, so the global settings are what should be
         # running. Skipping this would leave the enforce pass below defending a
@@ -770,13 +780,14 @@ def _check_and_enforce() -> None:
         else:
             why = f"global TDP on AC change (ac={ac_now})"
         _apply_and_record(*_global_triplet(s), why)
-        return
+        return events
 
     _enforce_target(_clamp_triplet(
         s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
         s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
         s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
     ))
+    return events
 
 
 # WMI reads back the exact value we wrote, so a tight tolerance is right there. The
@@ -992,6 +1003,31 @@ class Plugin:
         global _panel_active
         _panel_active = active
 
+    async def reapply(self) -> dict:
+        """Force the saved limits back onto the hardware.
+
+        Called by the frontend on resume from suspend, where the SMU comes back
+        at firmware defaults. Decky has no backend resume hook - the loader only
+        ever invokes _migration, _main, _unload and _uninstall - so Steam's own
+        notification is the only signal there is, and without it the enforce
+        loop takes up to five seconds to notice.
+        """
+        def _do() -> dict:
+            s = _load_settings()
+            if not s.get("enabled", True):
+                return {"success": True, "skipped": True}
+            # Whatever was cached describes the pre-suspend hardware.
+            _invalidate_limits_cache()
+            result = _apply_limits(*_clamp_triplet(
+                s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
+                s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
+                s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+            ))
+            decky.logger.info(
+                f"[legotdp] reapply after resume: success={result['success']}")
+            return {"success": result["success"], "skipped": False}
+        return await _offload(_do)
+
     async def set_active_app(self, app_id: str) -> None:
         """Frontend reports the authoritative running-game appid (or '' for none)."""
         global _frontend_appid, _frontend_appid_ts
@@ -1056,27 +1092,47 @@ class Plugin:
     async def _info_loop(self):
         while True:
             await asyncio.sleep(2)
-            if _panel_active:
-                try:
-                    await _offload(_refresh_info_cache)
-                except Exception as e:
-                    decky.logger.warning(f"[legotdp] info loop error: {e}")
+            if not _panel_active:
+                continue
+            try:
+                await _offload(_refresh_info_cache)
+                with _info_cache_lock:
+                    values = dict(_info_cache)
+                # Pushed, not polled. The panel used to ask for this over RPC every
+                # two seconds - a round trip per tick to fetch numbers the backend
+                # had just refreshed on this very schedule.
+                await decky.emit("tdp_info", {"success": True, "values": values})
+            except Exception as e:
+                decky.logger.warning(f"[legotdp] info loop error: {e}")
 
     async def _enforce_loop(self):
         while True:
             await asyncio.sleep(5)
             try:
-                await _offload(_check_and_enforce)
+                for event, payload in (await _offload(_check_and_enforce)).items():
+                    await decky.emit(event, payload)
             except Exception as e:
                 decky.logger.warning(f"[legotdp] enforce iteration failed: {e}")
+
+    async def _migration(self):
+        """Fold the pre-1.5.0 files into Decky's store, before anything reads it.
+
+        This is the loader's own hook for the job: it runs to completion before
+        _main() is even scheduled, so no settings read can race the migration.
+
+        decky.migrate_settings() deliberately goes unused. It relocates a file
+        under its own basename and rm -rf's the source, so the legacy
+        PLUGIN_DIR/settings.json would land straight on top of the
+        SettingsManager store - identical filename - and replace the whole
+        keyed object with a flat pre-1.5.0 dict. That helper moves files; this
+        migration has to reshape them.
+        """
+        await _offload(_migrate)
 
     async def _main(self):
         decky.logger.info(f"[legotdp] startup  v{updater.plugin_version()}")
         try:
             global _current_ac_online
-            # Before anything reads settings: lifts the pre-1.5.0 files out of the
-            # plugin directory, which the next reinstall would have deleted.
-            await _offload(_migrate)
             # Resolve the trust store now so the log states up front whether downloads
             # and update checks will be able to verify certificates.
             await _offload(updater.ssl_context)
@@ -1125,22 +1181,32 @@ class Plugin:
         self._tasks = []
         decky.logger.info("[legotdp] unloaded")
 
-    # Decky calls these around system sleep on loader versions that support them.
-    # The enforce loop would notice the drift within five seconds anyway; doing it
-    # here means the limits are back before the first frame is drawn.
-    async def _suspend(self):
-        decky.logger.info("[legotdp] suspending")
+    async def _uninstall(self):
+        """Hand the hardware back before the plugin directory disappears.
 
-    async def _resume(self):
-        decky.logger.info("[legotdp] resumed, re-applying limits")
+        The firmware keeps whatever ppt_* triplet was last latched into the
+        'custom' profile, so without this an uninstall leaves the machine pinned
+        to the plugin's final TDP with nothing left installed to change it.
 
+        Nothing is cleaned off disk here: the loader removes the whole plugin
+        directory straight afterwards, and DECKY_PLUGIN_SETTINGS_DIR - where the
+        settings and per-game profiles live - is deliberately left alone, so a
+        reinstall still finds them.
+        """
         def _do() -> None:
-            s = _load_settings()
-            if not s.get("enabled", True):
+            # _unload() cancelled the enforce loop, but cancelling a task parked
+            # in run_in_executor does not stop the worker thread, so a pass may
+            # still be in flight holding this lock. Take it, or that pass could
+            # re-assert the limits after we have handed the profile back.
+            if not _apply_lock.acquire(timeout=8.0):
+                decky.logger.warning(
+                    "[legotdp] uninstall: apply busy, leaving the profile as it is")
                 return
-            _apply_limits(*_clamp_triplet(
-                s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
-                s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
-                s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
-            ))
+            try:
+                path = _profile_path()
+                if path and _write_profile(path, "balanced"):
+                    decky.logger.info("[legotdp] uninstall: platform profile -> balanced")
+            finally:
+                _apply_lock.release()
         await _offload(_do)
+        decky.logger.info("[legotdp] uninstalled")

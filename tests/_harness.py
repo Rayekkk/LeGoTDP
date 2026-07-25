@@ -42,9 +42,20 @@ class StubLogger:
         self._log("debug", message)
 
 
+#: Every (event, args) the backend pushed to the frontend, in order. Reset with
+#: `emitted.clear()`; the loader replaces decky.emit with a socket write, so this
+#: is the only place the payloads can be inspected.
+emitted: list = []
+
+
+async def _emit(event, *args):
+    emitted.append((event, args))
+
+
 _decky = types.ModuleType("decky")
 _decky.logger = StubLogger()
 _decky.DECKY_PLUGIN_SETTINGS_DIR = _settings_dir
+_decky.emit = _emit
 sys.modules["decky"] = _decky
 
 

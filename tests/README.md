@@ -48,8 +48,11 @@ LEGOTDP_PLUGIN_DIR=/home/deck/homebrew/plugins/LeGoTDP \
 - Drift enforcement. `_enforce_target` is driven by the hardware wandering off
   a target on its own, which cannot be staged; watch
   `journalctl -u plugin_loader | grep legotdp` under load instead.
-- Suspend and resume. `_resume()` is covered, but actually sleeping the console
-  is a manual check.
+- Suspend and resume. `reapply()` is covered, but the thing that calls it is
+  Steam's `RegisterForOnResumeFromSuspend` in the frontend - Decky has no
+  backend resume hook - so actually sleeping the console is a manual check.
+- `_uninstall()`. Removing the plugin is the only way to fire it; the check is
+  that the platform profile is back on `balanced` afterwards.
 - The update download, which needs a newer release to exist on GitHub.
 - The settings migration against a real pre-1.5.0 install. `Migration` in
   `test_logic.py` covers the logic with temporary files; the real check is

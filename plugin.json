@@ -4,7 +4,7 @@
   "flags": [
     "root"
   ],
-  "api_version": 2,
+  "api_version": 1,
   "main": "main.py",
   "bin": "dist/index.js",
   "version": "1.5.0",

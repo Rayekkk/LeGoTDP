@@ -189,6 +189,19 @@ class Updater:
     # ---- RPC bodies ---------------------------------------------------- #
 
     def plugin_version(self) -> str:
+        """The installed version, as the loader itself understands it.
+
+        DECKY_PLUGIN_VERSION is authoritative: PluginWrapper takes the version
+        from package.json, never from plugin.json, so that is the number Decky
+        shows in its own plugin list. Reading it here means the panel and the
+        loader can never disagree about what is installed.
+
+        Falls back to parsing plugin.json, which is what keeps this module
+        importable by the test suites with no loader in the environment.
+        """
+        version = os.environ.get("DECKY_PLUGIN_VERSION", "")
+        if version:
+            return version
         try:
             with open(os.path.join(self.plugin_dir, "plugin.json")) as f:
                 return json.load(f).get("version", "0.0.0")

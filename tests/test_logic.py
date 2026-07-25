@@ -1,4 +1,5 @@
 """Backend tests that need no Legion Go attached. These run in CI."""
+import asyncio
 import json
 import os
 import ssl
@@ -196,6 +197,69 @@ class Migration(unittest.TestCase):
             main.CURRENT_SCHEMA,
         )
 
+    def test_the_lifecycle_hook_runs_the_migration(self):
+        # Decky runs _migration() to completion before it even schedules _main(),
+        # which is the guarantee we want: no settings read can outrun it.
+        seed({})
+        self._write_legacy(settings={"spl": 8000, "sppt": 10000, "fppt": 15000})
+        asyncio.run(main.Plugin()._migration())
+        self.assertEqual(main._load_settings()["spl"], 8000)
+
+    def test_the_legacy_file_is_not_handed_to_decky_migrate_settings(self):
+        # decky.migrate_settings() would tar the legacy file into
+        # DECKY_PLUGIN_SETTINGS_DIR under its own basename and rm -rf the source.
+        # Both files are called settings.json, so that would drop a flat
+        # pre-1.5.0 dict straight on top of the SettingsManager store.
+        self.assertEqual(
+            os.path.basename(main.LEGACY_SETTINGS_FILE),
+            os.path.basename(main.settings.path),
+        )
+
+
+class EnforceEvents(unittest.TestCase):
+    """_check_and_enforce runs in an executor thread and so cannot await
+    decky.emit itself; it hands the events back for the async loop to push.
+    The panel's charger label depends on those arriving."""
+
+    def setUp(self):
+        seed(FIXTURE)
+        self._restore = {name: getattr(main, name) for name in (
+            "_get_ac_online", "_get_running_appid", "_apply_limits", "_enforce_target")}
+        self.applied = []
+        main._get_running_appid = lambda: ""
+        main._apply_limits = lambda *a: self.applied.append(a) or {
+            "success": True, "stdout": "", "stderr": "", "returncode": 0}
+        main._enforce_target = lambda want: None
+        main._current_game_id = ""
+        main._current_ac_online = False
+
+    def tearDown(self):
+        for name, original in self._restore.items():
+            setattr(main, name, original)
+
+    def _pass(self, ac: bool) -> dict:
+        main._get_ac_online = lambda: ac
+        return main._check_and_enforce()
+
+    def test_a_charger_change_is_announced(self):
+        self.assertEqual(self._pass(True), {"power_source": {"ac": True}})
+
+    def test_a_steady_charger_says_nothing(self):
+        self._pass(True)
+        # Emitting every five seconds regardless would wake the panel for nothing.
+        self.assertEqual(self._pass(True), {})
+
+    def test_unplugging_is_announced_too(self):
+        self._pass(True)
+        self.assertEqual(self._pass(False), {"power_source": {"ac": False}})
+
+    def test_a_disabled_plugin_emits_nothing(self):
+        settings = main._load_settings()
+        settings["enabled"] = False
+        main._save_settings(settings)
+        self.assertEqual(self._pass(True), {})
+        self.assertEqual(self.applied, [])
+
 
 class RyzenadjOutput(unittest.TestCase):
     SAMPLE = """
@@ -332,6 +396,25 @@ class Versions(unittest.TestCase):
     def test_plugin_version_matches_the_manifest(self):
         with open(os.path.join(main.PLUGIN_DIR, "plugin.json")) as handle:
             self.assertEqual(main.updater.plugin_version(), json.load(handle)["version"])
+
+    def test_the_loaders_version_wins_over_the_manifest(self):
+        # PluginWrapper takes the version from package.json, so that is what
+        # Decky's own plugin list shows. Preferring it here keeps the panel from
+        # contradicting the loader if the two manifests ever drift.
+        os.environ["DECKY_PLUGIN_VERSION"] = "9.9.9"
+        try:
+            self.assertEqual(main.updater.plugin_version(), "9.9.9")
+        finally:
+            del os.environ["DECKY_PLUGIN_VERSION"]
+
+    def test_the_two_manifests_agree(self):
+        # Nothing enforces this at runtime: the loader reads one file and the
+        # packaging script reads the other.
+        with open(os.path.join(main.PLUGIN_DIR, "plugin.json")) as handle:
+            plugin_json = json.load(handle)["version"]
+        with open(os.path.join(main.PLUGIN_DIR, "package.json")) as handle:
+            package_json = json.load(handle)["version"]
+        self.assertEqual(plugin_json, package_json)
 
 
 class DownloadDirectory(unittest.TestCase):

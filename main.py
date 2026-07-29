@@ -56,6 +56,39 @@ FALLBACK_STD_W = {"spl": 35, "sppt": 37, "fppt": 45}
 HARD_MIN_MW = 5000
 HARD_MAX_MW = 50000
 
+# Devices driven through the firmware alone. The plugin downloads ryzenadj
+# itself, and on these it simply does not: the firmware range is the whole
+# range that is wanted here, so there is nothing for a second tool to add. The
+# sliders stop at what the firmware reports rather than at the Extras ceiling.
+#
+# Matched on DMI product_family, which names the family rather than the SKU -
+# a Legion Go S reports "Legion Go S 8APU1" whatever the model number on the
+# box. Anything that does not match is left on the path it has always taken,
+# so a device that is not listed here behaves exactly as it did before.
+WMI_ONLY_FAMILIES = ("legion go s",)
+
+# Preset ladders in watts. They are spaced against what each machine's firmware
+# actually accepts, so the top of the ladder is the top of the hardware rather
+# than a number carried over from a different device. Served to the panel so
+# there is one place to change them.
+PRESETS_DEFAULT = {
+    "minimum":     {"spl": 5,  "sppt": 5,  "fppt": 10},
+    "silent":      {"spl": 8,  "sppt": 10, "fppt": 15},
+    "balanced":    {"spl": 15, "sppt": 18, "fppt": 25},
+    "performance": {"spl": 25, "sppt": 28, "fppt": 35},
+    "max":         {"spl": 35, "sppt": 37, "fppt": 45},
+}
+
+# Legion Go S: 40 / 43 / 53 W is exactly what its firmware reports as the
+# ceiling, so Max asks for all of it.
+PRESETS_LEGION_GO_S = {
+    "minimum":     {"spl": 5,  "sppt": 8,  "fppt": 10},
+    "silent":      {"spl": 8,  "sppt": 10, "fppt": 15},
+    "balanced":    {"spl": 18, "sppt": 20, "fppt": 25},
+    "performance": {"spl": 33, "sppt": 33, "fppt": 35},
+    "max":         {"spl": 40, "sppt": 43, "fppt": 53},
+}
+
 # Lenovo firmware attributes. Writing these goes through the EC instead of poking the
 # SMU directly, so the firmware stops fighting us and the values survive suspend.
 WMI_ROOT  = "/sys/class/firmware-attributes/lenovo-wmi-other-0/attributes"
@@ -98,6 +131,83 @@ _PANEL_ACTIVE_TTL_S = 90.0
 _frontend_appid: str = ""
 _frontend_appid_ts: float = 0.0
 _FRONTEND_APPID_TTL = 12.0
+
+
+# ── Device identity ────────────────────────────────────────────────────────────
+
+_wmi_only_cache: bool | None = None
+
+
+def _dmi(field: str) -> str:
+    try:
+        with open(f"/sys/class/dmi/id/{field}") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _wmi_only() -> bool:
+    """True on hardware this plugin drives through the firmware alone.
+
+    Read once: DMI does not change while the machine is running.
+    """
+    global _wmi_only_cache
+    if _wmi_only_cache is None:
+        # Each field is matched on its own. Joining them first would let a name
+        # straddle the seam - "Legion Go" followed by a version starting with
+        # "S" would read as "legion go s" and take a Go 2 down the wrong path.
+        fields = [_dmi(f).lower()
+                  for f in ("product_family", "product_version", "product_name")]
+        _wmi_only_cache = any(
+            name in field for field in fields for name in WMI_ONLY_FAMILIES)
+        if _wmi_only_cache:
+            decky.logger.info(
+                f"[legotdp] {_dmi('product_family') or _dmi('product_name')}: "
+                "firmware interface only, Extras range unavailable")
+    return _wmi_only_cache
+
+
+def _presets() -> dict:
+    """The preset ladder for the hardware in front of us."""
+    return PRESETS_LEGION_GO_S if _wmi_only() else PRESETS_DEFAULT
+
+
+def _ceilings_mw() -> tuple[int, int, int]:
+    """(spl, sppt, fppt) ceilings in milliwatts.
+
+    One per parameter, because the firmware does not use the same limit for all
+    three - a Legion Go S reports 40 / 43 / 53 W. Everywhere else this stays the
+    Extras ceiling, which ryzenadj reaches.
+
+    A firmware that will not answer keeps the old bound rather than collapsing
+    the sliders: better to leave them where they were than to silently cap
+    somebody at the minimum.
+    """
+    if not _wmi_only():
+        return HARD_MAX_MW, HARD_MAX_MW, HARD_MAX_MW
+    caps = _wmi_caps()
+    if not caps:
+        return HARD_MAX_MW, HARD_MAX_MW, HARD_MAX_MW
+    return tuple(caps[k]["max"] * 1000 for k in ("spl", "sppt", "fppt"))
+
+
+# Plugging the charger in makes the firmware apply a profile of its own, and it
+# lands after ours: measured on a Legion Go S, an apply at the moment of the
+# transition wrote 40/43/53 and the attributes read back 10/15/20 - the
+# low-power defaults - a fraction of a second later. One write at the instant
+# the state changes is simply too early, so the values go back several times
+# over the seconds that follow, until one of them is the last word.
+#
+# Unplugging does not need this; it is included anyway because it costs one
+# comparison and the firmware is free to grow the same behaviour there.
+AC_SETTLE_DELAYS_S = (0.5, 1.5, 3.0, 6.0)
+
+# What the last charger transition asked for. The ladder re-asserts this rather
+# than the recorded active_* triplet, because a failed apply records nothing -
+# and a failure is precisely when the ladder is needed. Reading active_* there
+# would put back whatever ran before the transition, which with a per-game AC
+# profile is the wrong half of it.
+_ac_target: tuple = ()
 
 
 # ── AC power detection ─────────────────────────────────────────────────────────
@@ -218,9 +328,10 @@ def _clamp_triplet(spl, sppt, fppt) -> tuple[int, int, int]:
         spl, sppt, fppt = int(spl), int(sppt), int(fppt)
     except (TypeError, ValueError):
         return DEFAULT_SETTINGS["spl"], DEFAULT_SETTINGS["sppt"], DEFAULT_SETTINGS["fppt"]
-    spl  = max(HARD_MIN_MW, min(spl,  HARD_MAX_MW))
-    fppt = max(spl,         min(fppt, HARD_MAX_MW))
-    sppt = max(spl,         min(sppt, fppt))
+    spl_max, sppt_max, fppt_max = _ceilings_mw()
+    spl  = max(HARD_MIN_MW, min(spl,  spl_max))
+    fppt = max(spl,         min(fppt, fppt_max))
+    sppt = max(spl,         min(sppt, min(sppt_max, fppt)))
     return spl, sppt, fppt
 
 
@@ -618,8 +729,17 @@ def _apply_limits(spl_mw: int, sppt_mw: int, fppt_mw: int) -> dict:
                 _applied_mw, _applied_at = (spl_mw, sppt_mw, fppt_mw), time.monotonic()
                 _invalidate_limits_cache()
                 return result
+            if _wmi_only():
+                # Say what actually happened. ryzenadj is deliberately not
+                # installed here, so falling through to it would only turn a
+                # firmware refusal into a confusing "ryzenadj not found".
+                return result
             decky.logger.warning(
                 f"[legotdp] WMI apply failed ({result['stderr']}), falling back to ryzenadj")
+        if _wmi_only():
+            return {"success": False, "stdout": "",
+                    "stderr": "requested limits are outside what the firmware accepts",
+                    "returncode": -1}
         result = _apply_ryzenadj(spl_mw, sppt_mw, fppt_mw)
         if result["success"]:
             _last_source = "ryzenadj"
@@ -850,6 +970,32 @@ def _apply_and_record(spl: int, sppt: int, fppt: int, why: str) -> None:
             f"rc={result['returncode']} err={result['stderr']}")
 
 
+def _reapply_current_target() -> bool:
+    """Re-assert whatever the enforce pass is currently defending.
+
+    Returns True once the hardware already agrees, so the caller can stop early
+    rather than keep writing at something that has settled.
+    """
+    global _ac_target
+    s = _load_settings()
+    if not s.get("enabled", True):
+        _ac_target = ()
+        return True
+    target = _ac_target or _clamp_triplet(
+        s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
+        s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
+        s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+    )
+    if _ppt_matches(*(v // 1000 for v in target)):
+        _ac_target = ()
+        return True
+    _apply_and_record(*target, "TDP after a charger transition")
+    if _ppt_matches(*(v // 1000 for v in target)):
+        _ac_target = ()
+        return True
+    return False
+
+
 def _check_and_enforce() -> dict:
     """One enforce pass.
 
@@ -857,7 +1003,7 @@ def _check_and_enforce() -> dict:
     which cannot await decky.emit itself, so the async loop above does the
     emitting - that is what lets the panel stop polling for the charger state.
     """
-    global _current_game_id, _current_ac_online
+    global _current_game_id, _current_ac_online, _ac_target
 
     s = _load_settings()
     if not s.get("enabled", True):
@@ -878,8 +1024,11 @@ def _check_and_enforce() -> dict:
         profile = _load_profiles().get(appid) if appid else None
         if profile is not None:
             trigger = "AC state change" if ac_changed else "game launch"
-            _apply_and_record(*_pick_profile_values(profile, ac_now),
-                              f"game profile for app={appid} on {trigger} (ac={ac_now})")
+            target = _pick_profile_values(profile, ac_now)
+            if ac_changed:
+                _ac_target = target
+            _apply_and_record(
+                *target, f"game profile for app={appid} on {trigger} (ac={ac_now})")
             return events
 
         # Nothing per-game applies, so the global settings are what should be
@@ -891,7 +1040,10 @@ def _check_and_enforce() -> dict:
             why = "global TDP, game exited"
         else:
             why = f"global TDP on AC change (ac={ac_now})"
-        _apply_and_record(*_global_triplet(s), why)
+        target = _global_triplet(s)
+        if ac_changed:
+            _ac_target = target
+        _apply_and_record(*target, why)
         return events
 
     _enforce_target(_clamp_triplet(
@@ -1092,11 +1244,18 @@ class Plugin:
         `max` is the Extras range, which falls through to ryzenadj."""
         def _do() -> dict:
             caps = _wmi_caps()
+            std = {k: caps[k]["max"] for k in WMI_ATTRS} if caps else dict(FALLBACK_STD_W)
             return {
                 "min": min(caps[k]["min"] for k in WMI_ATTRS) if caps else HARD_MIN_MW // 1000,
-                "std": {k: caps[k]["max"] for k in WMI_ATTRS} if caps else dict(FALLBACK_STD_W),
-                "max": {k: HARD_MAX_MW // 1000 for k in WMI_ATTRS},
+                "std": std,
+                # ryzenadj is not installed on these, so the two ranges are
+                # the same and the frontend hides the Extras switch rather than
+                # offering a range nothing here would apply.
+                "max": dict(std) if _wmi_only()
+                       else {k: HARD_MAX_MW // 1000 for k in WMI_ATTRS},
                 "wmi": bool(caps),
+                "extras": not _wmi_only(),
+                "presets": _presets(),
             }
         return await _offload(_do)
 
@@ -1244,11 +1403,35 @@ class Plugin:
             except Exception as e:
                 decky.logger.warning(f"[legotdp] info loop error: {e}")
 
+    async def _resettle_after_ac(self):
+        """Put the limits back over the seconds after a charger transition.
+
+        The firmware writes its own profile on plug-in and wins the race against
+        a single apply, so the target is re-asserted until it stops being
+        overwritten. Each pass is skipped once the hardware already agrees, so
+        this costs nothing when the first write did stick.
+        """
+        for delay in AC_SETTLE_DELAYS_S:
+            await asyncio.sleep(delay)
+            try:
+                settled = await _offload(_reapply_current_target)
+            except Exception as e:
+                decky.logger.warning(f"[legotdp] AC re-settle failed: {e}")
+                return
+            if settled:
+                return
+
     async def _enforce_loop(self):
         while True:
             await asyncio.sleep(5)
             try:
-                for event, payload in (await _offload(_check_and_enforce)).items():
+                events = await _offload(_check_and_enforce)
+                if "power_source" in events:
+                    # Deliberately not awaited: the ladder runs for several
+                    # seconds and the enforce loop has its own schedule to keep.
+                    self._tasks.append(
+                        asyncio.create_task(self._resettle_after_ac()))
+                for event, payload in events.items():
                     await decky.emit(event, payload)
             except Exception as e:
                 decky.logger.warning(f"[legotdp] enforce iteration failed: {e}")
@@ -1290,7 +1473,11 @@ class Plugin:
             _current_ac_online = await _offload(_get_ac_online)
             wmi = await _offload(_wmi_caps)
             try:
-                await _offload(_ensure_ryzenadj)
+                if _wmi_only():
+                    decky.logger.info(
+                        "[legotdp] firmware-only device, skipping the ryzenadj download")
+                else:
+                    await _offload(_ensure_ryzenadj)
             except Exception as e:
                 # Only fatal when there is no firmware path to fall back on.
                 if not wmi:

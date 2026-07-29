@@ -2,6 +2,31 @@
 
 All notable changes to LeGoTDP, newest first.
 
+## [1.6.0] - 2026-07-28
+
+### Added
+
+- Support for the Lenovo Legion Go S with the Ryzen Z1 Extreme, which is the variant this was measured and tested on. It drives the same Lenovo firmware interface as the Go 2, so everything except the extended range works there unchanged.
+- Other Legion Go S variants, including the Ryzen Z2 Go, take the same firmware-only path but are untested. Nothing there is assumed: the limits come from what that machine's own firmware reports, so a variant with different ceilings gets its own rather than the Z1 Extreme's.
+
+### Fixed
+
+- TDP is restored after the charger is plugged in. The firmware applies a profile of its own on that transition and it lands after the plugin's, so a single write at the moment the state changed was overwritten a fraction of a second later - measured on a Legion Go S as 40/43/53 W asked for and 10/15/20 W in place. The limits are now re-asserted over the following seconds until they stop being overwritten, and each pass is skipped once the hardware already agrees.
+
+### Changed
+
+- The Current TDP panel is always shown, including while the plugin is switched off. With it off that reading is the only way to see what the firmware settled on, which is exactly when it is worth having.
+- Presets are spaced against the ceilings of the machine they run on and served by the backend, so there is one place that knows them. A Legion Go S gets 5/8/10, 8/10/15, 18/20/25, 33/33/35 and 40/43/53 W - its Max asks for everything the firmware reports. The Legion Go 2 ladder is unchanged.
+- Slider ceilings are taken per parameter from what the firmware reports it accepts, instead of one shared limit. A Legion Go S answers 40 / 43 / 53 W for SPL / SPPT / FPPT, and the sliders now stop at each of those rather than at the highest.
+- Profiles carried over from another machine are clamped to what the hardware in front of you actually takes, so a 50 W profile no longer arrives as a request the firmware will refuse.
+- The Extras section is hidden on hardware driven through the firmware alone, and `ryzenadj` is not downloaded there. The plugin fetches that binary itself when the extended range needs it, and on those machines it is not wanted - the firmware range is the whole range.
+- A firmware apply that falls outside the accepted range now says so, instead of failing over to a tool that was never installed.
+
+### Internal
+
+- Hardware is recognised by DMI product family rather than model number, so other SKUs in the same family are covered. Anything unrecognised keeps the behaviour it had, which is what leaves the Legion Go 2 path untouched.
+- Backend tests up to 104 from 93.
+
 ## [1.5.0] - 2026-07-25
 
 ### Added

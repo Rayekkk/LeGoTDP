@@ -87,7 +87,12 @@ function makeTuningHandlers(t: Tuning, set: (next: Tuning) => void, caps: Caps, 
 // ── Presets ────────────────────────────────────────────────────────────────────
 type PresetKey = "minimum" | "silent" | "balanced" | "performance" | "max" | "custom";
 
-const PRESETS: Record<Exclude<PresetKey, "custom">, { spl: number; sppt: number; fppt: number }> = {
+type PresetTable = Record<Exclude<PresetKey, "custom">,
+                          { spl: number; sppt: number; fppt: number }>;
+
+// Used until get_caps() answers with the ladder for this machine. The backend
+// is the source of truth, because it is the side that knows the hardware.
+const PRESETS: PresetTable = {
   minimum:     { spl: 5,  sppt: 5,  fppt: 10 },
   silent:      { spl: 8,  sppt: 10, fppt: 15 },
   balanced:    { spl: 15, sppt: 18, fppt: 25 },
@@ -106,21 +111,23 @@ const PRESET_LABELS: Record<PresetKey, string> = {
 
 const PRESET_ORDER: PresetKey[] = ["minimum", "silent", "balanced", "performance", "max", "custom"];
 
-function detectPreset(spl: number, sppt: number, fppt: number): PresetKey {
-  for (const key of Object.keys(PRESETS) as Exclude<PresetKey, "custom">[]) {
-    const v = PRESETS[key];
+function detectPreset(spl: number, sppt: number, fppt: number,
+                      table: PresetTable = PRESETS): PresetKey {
+  for (const key of Object.keys(table) as Exclude<PresetKey, "custom">[]) {
+    const v = table[key];
     if (v.spl === spl && v.sppt === sppt && v.fppt === fppt) return key;
   }
   return "custom";
 }
 
-function profileLabel(spl: number, sppt: number, fppt: number, stored?: string): string {
+function profileLabel(spl: number, sppt: number, fppt: number, stored?: string,
+                      table: PresetTable = PRESETS): string {
   const customLabel = `Custom (${spl} +${sppt - spl}/+${fppt - spl})`;
   if (stored !== undefined) {
     if (stored === "custom" || stored === "") return customLabel;
     return PRESET_LABELS[stored as PresetKey] ?? stored;
   }
-  const key = detectPreset(spl, sppt, fppt);
+  const key = detectPreset(spl, sppt, fppt, table);
   return key === "custom" ? customLabel : PRESET_LABELS[key];
 }
 
@@ -149,7 +156,8 @@ interface GameProfile {
   ac_separate: boolean;
   ac_profile: { spl: number; sppt: number; fppt: number; ac_preset?: string };
 }
-interface CapsInfo   { min: number; std: Caps; max: Caps; wmi: boolean }
+interface CapsInfo   { min: number; std: Caps; max: Caps; wmi: boolean; extras?: boolean;
+                       presets?: PresetTable }
 interface RunningGame { appId: string; name: string }
 interface ReadyState  { ready: boolean; error: string }
 interface UpdateInfo {
@@ -621,6 +629,10 @@ const Content: FC = () => {
 
   const [stdCaps, setStdCaps] = useState<Caps>(FALLBACK_STD);
   const [maxCaps, setMaxCaps] = useState<Caps>(FALLBACK_MAX);
+  // Hardware with no ryzenadj path has nothing above the firmware to unlock.
+  const [extrasAvailable, setExtrasAvailable] = useState(true);
+  // The ladder is per machine, so it comes from the backend with the ceilings.
+  const [presets, setPresets] = useState<PresetTable>(PRESETS);
   const [minW,    setMinW]    = useState(FALLBACK_MIN);
 
   const [enabled,       setEnabled]       = useState(true);
@@ -648,7 +660,7 @@ const Content: FC = () => {
 
   useEffect(() => () => { if (statusTimerRef.current) clearTimeout(statusTimerRef.current); }, []);
 
-  const caps    = extrasUnlocked ? maxCaps : stdCaps;
+  const caps    = extrasUnlocked && extrasAvailable ? maxCaps : stdCaps;
   const active  = editingAc ? acTuning : tuning;
   const setActive = editingAc ? setAcTuning : setTuning;
   const handlers = makeTuningHandlers(active, setActive, caps, minW);
@@ -684,7 +696,7 @@ const Content: FC = () => {
     const storedPreset = (p.preset as PresetKey | undefined) || undefined;
     setSavedPreset(storedPreset);
     setSavedAcPreset(gp.ac_separate ? (ac.ac_preset ?? "") : undefined);
-    setPreset(storedPreset || detectPreset(toW(p.spl), toW(p.sppt), toW(p.fppt)));
+    setPreset(storedPreset || detectPreset(toW(p.spl), toW(p.sppt), toW(p.fppt), presets));
     try {
       await applyTdp(p.spl, p.sppt, p.fppt, appId, "");
     } catch (e: unknown) {
@@ -707,11 +719,15 @@ const Content: FC = () => {
             getSettings(), getPowerSource(), getExtrasUnlocked(), getCaps(),
           ]);
           if (!active) return;
-          if (c?.std && c?.max) { setStdCaps(c.std); setMaxCaps(c.max); setMinW(c.min); }
+          if (c?.std && c?.max) {
+            setStdCaps(c.std); setMaxCaps(c.max); setMinW(c.min);
+            setExtrasAvailable(c.extras !== false);
+            if (c.presets) setPresets(c.presets);
+          }
           const w = toW(s.spl), sw = toW(s.sppt), fw = toW(s.fppt);
           setTuning(fromAbsolute(w, sw, fw));
           setGlobalProfile({ spl: w, sppt: sw, fppt: fw, preset: s.active_preset || undefined });
-          setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw));
+          setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw, presets));
           setEnabled(s.enabled !== false);
           setAcOnline(ps.ac);
           setExtrasUnlocked(eu);
@@ -781,7 +797,7 @@ const Content: FC = () => {
           const s = await getSettings();
           const w = toW(s.spl), sw = toW(s.sppt), fw = toW(s.fppt);
           setTuning(fromAbsolute(w, sw, fw));
-          setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw));
+          setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw, presets));
           setGlobalProfile({ spl: w, sppt: sw, fppt: fw, preset: s.active_preset || undefined });
           if (wasInGame) {
             await applyTdp(s.spl, s.sppt, s.fppt, "", s.active_preset || "");
@@ -816,7 +832,7 @@ const Content: FC = () => {
     setPreset(key);
     if (key === "custom") return;
 
-    const vals = PRESETS[key];
+    const vals = presets[key];
     const next = normalise(fromAbsolute(vals.spl, vals.sppt, vals.fppt), caps, minW);
     if (editingAc) setAcTuning(next); else setTuning(next);
 
@@ -873,7 +889,7 @@ const Content: FC = () => {
         const s = await getSettings();
         const w = toW(s.spl), sw = toW(s.sppt), fw = toW(s.fppt);
         setTuning(fromAbsolute(w, sw, fw));
-        setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw));
+        setPreset((s.active_preset as PresetKey | undefined) || detectPreset(w, sw, fw, presets));
         setGlobalProfile({ spl: w, sppt: sw, fppt: fw, preset: s.active_preset || undefined });
         await applyTdp(s.spl, s.sppt, s.fppt, "", s.active_preset || "");
         showStatus("Switched to global settings.");
@@ -1044,7 +1060,7 @@ const Content: FC = () => {
               enabled ? (
                 <span>
                   <span style={{ fontSize: "11px", color: DIM_COLOR }}>Global Profile: </span>
-                  <span style={styles.profileTag}>{profileLabel(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, globalProfile.preset)}</span>
+                  <span style={styles.profileTag}>{profileLabel(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, globalProfile.preset, presets)}</span>
                   {!extrasUnlocked && exceedsCaps(globalProfile.spl, globalProfile.sppt, globalProfile.fppt, stdCaps) && (
                     <span style={{ fontSize: "11px", color: WARN_COLOR }}> ⚠ exceeds firmware limits</span>
                   )}
@@ -1064,6 +1080,8 @@ const Content: FC = () => {
         )}
       </PanelSection>
 
+      <LivePanel />
+
       {enabled && <>
         <PanelSection title="Game Profile">
           <PanelSectionRow>
@@ -1078,14 +1096,14 @@ const Content: FC = () => {
                         <span>
                           <span style={{ fontSize: "11px", color: DIM_COLOR }}>Battery: </span>
                           <span style={styles.profileTag}>
-                            {profileLabel(absolute(tuning).spl, absolute(tuning).sppt, absolute(tuning).fppt, savedPreset)}
+                            {profileLabel(absolute(tuning).spl, absolute(tuning).sppt, absolute(tuning).fppt, savedPreset, presets)}
                           </span>
                         </span>
                         {acSeparate && (
                           <span>
                             <span style={{ fontSize: "11px", color: DIM_COLOR }}>AC: </span>
                             <span style={styles.profileTag}>
-                              {profileLabel(absolute(acTuning).spl, absolute(acTuning).sppt, absolute(acTuning).fppt, savedAcPreset)}
+                              {profileLabel(absolute(acTuning).spl, absolute(acTuning).sppt, absolute(acTuning).fppt, savedAcPreset, presets)}
                             </span>
                           </span>
                         )}
@@ -1129,8 +1147,6 @@ const Content: FC = () => {
             </>
           )}
         </PanelSection>
-
-        <LivePanel />
 
         <PanelSection title="Preset">
           {PRESET_ORDER.map(key => (
@@ -1211,24 +1227,26 @@ const Content: FC = () => {
 
       <UpdateSection />
 
-      <PanelSection title="Extras">
-        <PanelSectionRow>
-          <div style={styles.infoBox}>
-            These settings are for advanced users only and are NOT recommended.
-            Changes are made at your own risk — they override the manufacturer's TDP safety limits.
-          </div>
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <ToggleField
-            label={`Unlock Custom TDP to ${maxCaps.spl} W`}
-            description={extrasUnlocked
-              ? `Custom sliders extended to ${maxCaps.spl} W - applied via ryzenadj instead of firmware`
-              : `Enable to allow Custom sliders up to ${maxCaps.spl} W`}
-            checked={extrasUnlocked}
-            onChange={handleExtrasUnlockedToggle}
-          />
-        </PanelSectionRow>
-      </PanelSection>
+      {extrasAvailable && (
+        <PanelSection title="Extras">
+          <PanelSectionRow>
+            <div style={styles.infoBox}>
+              These settings are for advanced users only and are NOT recommended.
+              Changes are made at your own risk — they override the manufacturer's TDP safety limits.
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ToggleField
+              label={`Unlock Custom TDP to ${maxCaps.spl} W`}
+              description={extrasUnlocked
+                ? `Custom sliders extended to ${maxCaps.spl} W - applied via ryzenadj instead of firmware`
+                : `Enable to allow Custom sliders up to ${maxCaps.spl} W`}
+              checked={extrasUnlocked}
+              onChange={handleExtrasUnlockedToggle}
+            />
+          </PanelSectionRow>
+        </PanelSection>
+      )}
     </>
   );
 };

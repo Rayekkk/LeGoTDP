@@ -823,3 +823,352 @@ class ProfileLookup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FirmwareOnlyHardware(unittest.TestCase):
+    """A Legion Go S has no ryzenadj path, so the sliders stop where the
+    firmware does. Anything not on the list keeps the behaviour it had."""
+
+    GO_S = {"product_family": "Legion Go S 8APU1", "product_version": "Legion Go S 8APU1",
+            "product_name": "83N6"}
+    GO_2 = {"product_family": "Legion Go 2", "product_version": "Legion Go 2",
+            "product_name": "83Q1"}
+    UNKNOWN = {"product_family": "", "product_version": "", "product_name": ""}
+
+    # Measured on the device.
+    GO_S_CAPS = {"spl": {"min": 5, "max": 40},
+                 "sppt": {"min": 5, "max": 43},
+                 "fppt": {"min": 5, "max": 53}}
+
+    def setUp(self):
+        self.real_dmi, self.real_caps = main._dmi, main._wmi_caps
+        main._wmi_only_cache = None
+
+    def tearDown(self):
+        main._dmi, main._wmi_caps = self.real_dmi, self.real_caps
+        main._wmi_only_cache = None
+
+    def _as(self, dmi, caps=None):
+        main._dmi = lambda field: dmi.get(field, "")
+        main._wmi_caps = lambda: caps if caps is not None else {}
+        main._wmi_only_cache = None
+
+    def test_a_legion_go_s_is_recognised(self):
+        self._as(self.GO_S)
+        self.assertTrue(main._wmi_only())
+
+    def test_a_legion_go_2_is_not(self):
+        """The whole point: hardware that is not listed must be untouched."""
+        self._as(self.GO_2)
+        self.assertFalse(main._wmi_only())
+
+    def test_hardware_that_says_nothing_is_not(self):
+        self._as(self.UNKNOWN)
+        self.assertFalse(main._wmi_only())
+
+    def test_the_match_is_on_the_family_not_the_model_number(self):
+        """Other Go S SKUs carry a different product_name but the same family."""
+        self._as({"product_family": "Legion Go S 8APU1", "product_name": "83L3"})
+        self.assertTrue(main._wmi_only())
+
+    def test_each_parameter_gets_its_own_firmware_ceiling(self):
+        """The firmware does not use one limit for all three: 40 / 43 / 53 W."""
+        self._as(self.GO_S, self.GO_S_CAPS)
+        self.assertEqual(main._ceilings_mw(), (40000, 43000, 53000))
+
+    def test_the_extras_ceiling_is_kept_everywhere_else(self):
+        self._as(self.GO_2, self.GO_S_CAPS)
+        self.assertEqual(main._ceilings_mw(),
+                         (main.HARD_MAX_MW,) * 3)
+
+    def test_an_unreadable_firmware_does_not_lower_the_ceiling(self):
+        """Better to keep the old bound than to silently cap someone at 5 W."""
+        self._as(self.GO_S, {})
+        self.assertEqual(main._ceilings_mw(), (main.HARD_MAX_MW,) * 3)
+
+    def test_saved_values_are_clamped_to_what_the_hardware_takes(self):
+        """A profile written on a Go 2 must not push 50 W into a 40 W device."""
+        self._as(self.GO_S, self.GO_S_CAPS)
+        self.assertEqual(main._clamp_triplet(50000, 50000, 50000),
+                         (40000, 43000, 50000))
+
+    def test_the_ordering_invariant_survives_the_per_parameter_clamp(self):
+        self._as(self.GO_S, self.GO_S_CAPS)
+        spl, sppt, fppt = main._clamp_triplet(50000, 6000, 7000)
+        self.assertLessEqual(spl, sppt)
+        self.assertLessEqual(sppt, fppt)
+
+    def test_the_same_values_are_left_alone_elsewhere(self):
+        self._as(self.GO_2, self.GO_S_CAPS)
+        self.assertEqual(main._clamp_triplet(50000, 50000, 50000),
+                         (50000, 50000, 50000))
+
+    def test_the_answer_is_cached(self):
+        calls = []
+
+        def counting(field):
+            calls.append(field)
+            return self.GO_S.get(field, "")
+
+        main._dmi = counting
+        main._wmi_only_cache = None
+        main._wmi_only()
+        first = len(calls)
+        main._wmi_only()
+        self.assertEqual(len(calls), first)
+
+
+class ChargerTransition(unittest.TestCase):
+    """Plugging the charger in makes the firmware write a profile of its own,
+    and it lands after ours. Measured on a Legion Go S: an apply at the instant
+    of the transition wrote 40/43/53 and the attributes read 10/15/20 a moment
+    later."""
+
+    TARGET = (33000, 33000, 35000)
+
+    def setUp(self):
+        self.real_matches = main._ppt_matches
+        self.real_apply = main._apply_limits
+        self.real_save = main._save_active
+        self.applied = []
+        main._save_active = lambda *a, **k: None
+        seed({"schema_version": 2, "settings": {
+            "spl": self.TARGET[0], "sppt": self.TARGET[1], "fppt": self.TARGET[2],
+            "active_spl": self.TARGET[0], "active_sppt": self.TARGET[1],
+            "active_fppt": self.TARGET[2], "enabled": True}})
+
+    def tearDown(self):
+        main._ppt_matches = self.real_matches
+        main._apply_limits = self.real_apply
+        main._save_active = self.real_save
+
+    def _hardware(self, agrees_after: int):
+        """Firmware that keeps our values only from the nth check onwards."""
+        state = {"n": 0}
+
+        def matches(*_args):
+            state["n"] += 1
+            return state["n"] > agrees_after
+
+        main._ppt_matches = matches
+        main._apply_limits = lambda *a: (
+            self.applied.append(tuple(a)) or
+            {"success": True, "stdout": "", "stderr": "", "returncode": 0})
+
+    def test_nothing_is_written_when_the_values_already_stuck(self):
+        self._hardware(agrees_after=0)
+        self.assertTrue(main._reapply_current_target())
+        self.assertEqual(self.applied, [])
+
+    def test_the_target_is_put_back_when_the_firmware_overwrote_it(self):
+        self._hardware(agrees_after=1)
+        main._reapply_current_target()
+        self.assertEqual(self.applied, [self.TARGET])
+
+    def test_it_reports_whether_the_value_stuck_this_time(self):
+        self._hardware(agrees_after=1)
+        self.assertTrue(main._reapply_current_target())
+        self.applied.clear()
+        self._hardware(agrees_after=99)
+        self.assertFalse(main._reapply_current_target())
+
+    def test_a_disabled_plugin_is_left_alone(self):
+        seed({"schema_version": 2, "settings": {"enabled": False}})
+        self._hardware(agrees_after=99)
+        self.assertTrue(main._reapply_current_target())
+        self.assertEqual(self.applied, [])
+
+    def test_the_ladder_spans_several_seconds_and_starts_soon(self):
+        """The firmware's own write lands within a second; the last rung has to
+        be late enough to outlast it."""
+        delays = main.AC_SETTLE_DELAYS_S
+        self.assertLess(delays[0], 1.0)
+        self.assertEqual(list(delays), sorted(delays))
+        self.assertGreaterEqual(sum(delays), 5.0)
+
+
+class ChargerTransitionWithGameProfile(unittest.TestCase):
+    """The case the ladder exists for is a failed apply, and a failed apply
+    records nothing - so re-reading active_* would put back whatever ran before
+    the transition. With a per-game AC profile that is the wrong half of it."""
+
+    BATTERY = (15000, 18000, 25000)
+    ON_AC   = (25000, 28000, 35000)
+
+    def setUp(self):
+        self.real_matches, self.real_apply = main._ppt_matches, main._apply_limits
+        self.real_save, self.real_ac = main._save_active, main._get_ac_online
+        self.real_appid = main._get_running_appid
+        self.applied = []
+        main._save_active = lambda *a, **k: None
+        main._get_running_appid = lambda: "730"
+        main._ac_target = ()
+        main._current_ac_online = False
+        main._current_game_id = "730"
+        seed({"schema_version": 2,
+              "settings": {"spl": self.BATTERY[0], "sppt": self.BATTERY[1],
+                           "fppt": self.BATTERY[2], "enabled": True,
+                           "active_spl": self.BATTERY[0],
+                           "active_sppt": self.BATTERY[1],
+                           "active_fppt": self.BATTERY[2]},
+              "game_profiles": {"730": {
+                  "spl": self.BATTERY[0], "sppt": self.BATTERY[1],
+                  "fppt": self.BATTERY[2], "ac_separate": True,
+                  "ac_spl": self.ON_AC[0], "ac_sppt": self.ON_AC[1],
+                  "ac_fppt": self.ON_AC[2]}}})
+
+    def tearDown(self):
+        main._ppt_matches, main._apply_limits = self.real_matches, self.real_apply
+        main._save_active, main._get_ac_online = self.real_save, self.real_ac
+        main._get_running_appid = self.real_appid
+        main._ac_target = ()
+        main._current_ac_online = False
+        main._current_game_id = ""
+
+    def _firmware_always_wins(self):
+        main._ppt_matches = lambda *a: False
+        main._apply_limits = lambda *a: (
+            self.applied.append(tuple(a)) or
+            {"success": False, "stdout": "", "stderr": "overwritten",
+             "returncode": -1})
+
+    def test_the_ladder_re_asserts_the_game_profile_not_the_old_values(self):
+        main._get_ac_online = lambda: True
+        self._firmware_always_wins()
+        main._check_and_enforce()               # the charger goes in
+        self.applied.clear()
+        main._reapply_current_target()          # one rung of the ladder
+        self.assertEqual(self.applied, [self.ON_AC],
+                         "the ladder must chase the AC half of the game profile")
+
+    def test_the_target_is_dropped_once_it_sticks(self):
+        main._get_ac_online = lambda: True
+        self._firmware_always_wins()
+        main._check_and_enforce()
+        self.assertEqual(main._ac_target, self.ON_AC)
+        main._ppt_matches = lambda *a: True
+        self.assertTrue(main._reapply_current_target())
+        self.assertEqual(main._ac_target, ())
+
+    def test_a_game_launch_without_an_ac_change_arms_nothing(self):
+        """Only a charger transition needs chasing; a launch does not."""
+        main._get_ac_online = lambda: False
+        main._current_game_id = ""
+        self._firmware_always_wins()
+        main._check_and_enforce()
+        self.assertEqual(main._ac_target, ())
+
+
+class PresetLadders(unittest.TestCase):
+    """Each machine gets a ladder spaced against its own firmware ceiling."""
+
+    GO_S = {"product_family": "Legion Go S 8APU1"}
+    GO_2 = {"product_family": "Legion Go 2"}
+
+    def setUp(self):
+        self.real_dmi = main._dmi
+        main._wmi_only_cache = None
+
+    def tearDown(self):
+        main._dmi = self.real_dmi
+        main._wmi_only_cache = None
+
+    def _as(self, dmi):
+        main._dmi = lambda field: dmi.get(field, "")
+        main._wmi_only_cache = None
+
+    def test_a_legion_go_s_gets_its_own_ladder(self):
+        self._as(self.GO_S)
+        self.assertEqual(main._presets(), main.PRESETS_LEGION_GO_S)
+
+    def test_everything_else_keeps_the_one_it_had(self):
+        self._as(self.GO_2)
+        self.assertEqual(main._presets(), main.PRESETS_DEFAULT)
+
+    def test_the_go_s_ladder_is_the_one_that_was_asked_for(self):
+        self.assertEqual(main.PRESETS_LEGION_GO_S, {
+            "minimum":     {"spl": 5,  "sppt": 8,  "fppt": 10},
+            "silent":      {"spl": 8,  "sppt": 10, "fppt": 15},
+            "balanced":    {"spl": 18, "sppt": 20, "fppt": 25},
+            "performance": {"spl": 33, "sppt": 33, "fppt": 35},
+            "max":         {"spl": 40, "sppt": 43, "fppt": 53},
+        })
+
+    def test_the_go_2_ladder_was_not_touched(self):
+        self.assertEqual(main.PRESETS_DEFAULT["max"],
+                         {"spl": 35, "sppt": 37, "fppt": 45})
+
+    def test_every_ladder_rung_is_ordered_and_rises(self):
+        for name, table in (("default", main.PRESETS_DEFAULT),
+                            ("go_s", main.PRESETS_LEGION_GO_S)):
+            previous = 0
+            for key in ("minimum", "silent", "balanced", "performance", "max"):
+                v = table[key]
+                self.assertLessEqual(v["spl"], v["sppt"], f"{name}/{key}")
+                self.assertLessEqual(v["sppt"], v["fppt"], f"{name}/{key}")
+                self.assertGreater(v["spl"], previous, f"{name}/{key}")
+                previous = v["spl"]
+
+    def test_the_go_s_top_rung_is_exactly_the_firmware_ceiling(self):
+        """Measured on the device: 40 / 43 / 53 W."""
+        self._as(self.GO_S)
+        real = main._wmi_caps
+        main._wmi_caps = lambda: {"spl": {"min": 5, "max": 40},
+                                  "sppt": {"min": 5, "max": 43},
+                                  "fppt": {"min": 5, "max": 53}}
+        try:
+            ceilings = tuple(v // 1000 for v in main._ceilings_mw())
+        finally:
+            main._wmi_caps = real
+        top = main.PRESETS_LEGION_GO_S["max"]
+        self.assertEqual((top["spl"], top["sppt"], top["fppt"]), ceilings)
+
+    def test_no_rung_asks_for_more_than_the_hardware_takes(self):
+        self._as(self.GO_S)
+        real = main._wmi_caps
+        main._wmi_caps = lambda: {"spl": {"min": 5, "max": 40},
+                                  "sppt": {"min": 5, "max": 43},
+                                  "fppt": {"min": 5, "max": 53}}
+        try:
+            for key, v in main.PRESETS_LEGION_GO_S.items():
+                got = main._clamp_triplet(v["spl"] * 1000, v["sppt"] * 1000,
+                                          v["fppt"] * 1000)
+                self.assertEqual(got, (v["spl"] * 1000, v["sppt"] * 1000,
+                                       v["fppt"] * 1000), key)
+        finally:
+            main._wmi_caps = real
+
+
+class DeviceMatchIsPerField(unittest.TestCase):
+    """Measured: a Legion Go 2 reports product_family "Legion Go 8ASP2" and a
+    Legion Go S reports "Legion Go S 8APU1". Close enough that how the fields
+    are searched matters."""
+
+    def setUp(self):
+        self.real_dmi = main._dmi
+        main._wmi_only_cache = None
+
+    def tearDown(self):
+        main._dmi = self.real_dmi
+        main._wmi_only_cache = None
+
+    def _as(self, **dmi):
+        main._dmi = lambda field: dmi.get(field, "")
+        main._wmi_only_cache = None
+
+    def test_the_real_legion_go_2_is_not_matched(self):
+        self._as(product_family="Legion Go 8ASP2",
+                 product_version="Legion Go 8ASP2", product_name="83N0")
+        self.assertFalse(main._wmi_only())
+
+    def test_the_real_legion_go_s_is(self):
+        self._as(product_family="Legion Go S 8APU1",
+                 product_version="Legion Go S 8APU1", product_name="83N6")
+        self.assertTrue(main._wmi_only())
+
+    def test_a_name_cannot_straddle_two_fields(self):
+        """Joining the fields first would read this as "legion go s" and send a
+        machine that is not one down the firmware-only path."""
+        self._as(product_family="Legion Go", product_version="Super 9",
+                 product_name="83N0")
+        self.assertFalse(main._wmi_only())

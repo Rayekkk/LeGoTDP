@@ -103,6 +103,14 @@ sys.path.insert(0, PLUGIN_DIR)
 import main  # noqa: E402
 import lego_updater as updater  # noqa: E402
 
+# DMI is an input like any other, so it is stubbed like any other: a suite that
+# read the real one would test the machine it happens to be running on rather
+# than the logic, and the same file would pass in CI and fail on a Legion Go S.
+# Tests that care about a particular device replace _dmi and reset the cache
+# themselves - see FirmwareOnlyHardware in test_logic.py.
+main._dmi = lambda field: ""
+main._wmi_only_cache = None
+
 
 def seed(blob: dict) -> None:
     """Replace the settings file and drop every piece of cached state."""

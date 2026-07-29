@@ -2,7 +2,9 @@
 
 A [DeckyLoader](https://github.com/SteamDeckHomebrew/decky-loader) plugin for setting AMD CPU TDP limits directly from the Steam overlay.
 
-Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Point).
+Designed for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Point) and the
+**Legion Go S** with the **Ryzen Z1 Extreme** (firmware interface only - see
+Hardware below).
 
 ---
 
@@ -14,14 +16,20 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 - **Per-game profiles** - automatically applied in the background when a game launches, no need to open the plugin menu
 - **Separate AC profile** - set independent TDP limits for battery and charging; switches automatically when AC state changes
 - **Live TDP panel** - shows current limits plus real-time package draw read from RAPL
-- **Drift enforcement** - re-applies your settings every 5 seconds if the system overrides them, cross-checks against a live reading twice a minute so an override that bypasses the firmware interface cannot hide, and stands down on targets the hardware refuses
+- **Drift enforcement** - re-applies your settings every 5 seconds if the system overrides them, and stands down on targets the hardware refuses. On the Legion Go 2 it also cross-checks against a live `ryzenadj` reading twice a minute, so an override that bypasses the firmware interface cannot hide; that check needs `ryzenadj`, so it does not run on firmware-only hardware
 - **Enable/disable toggle** - hands the platform profile back to the firmware when turned off
-- **Extended TDP range** - Extras section unlocks Custom sliders up to 50 W (advanced users, use at your own risk)
-- Auto-downloads a pre-built `ryzenadj` binary on first run (only needed for the extended range)
+- **Charger-aware** - the limits are re-asserted over the seconds after the charger goes in, because the firmware applies a profile of its own on that transition and it lands after ours
+- **Extended TDP range** (Legion Go 2) - Extras section unlocks Custom sliders up to 50 W (advanced users, use at your own risk)
+- Auto-downloads a pre-built `ryzenadj` binary on first run, only where the extended range needs it
 
 ---
 
 ## Presets
+
+Each machine gets its own ladder, spaced against the ceilings its firmware
+reports, so **Max** asks for exactly what that hardware accepts.
+
+**Legion Go 2**
 
 | Preset | SPL | SPPT | FPPT |
 |---|---|---|---|
@@ -31,17 +39,57 @@ Designed exclusively for the **Lenovo Legion Go 2** (Ryzen Z2 Extreme / Strix Po
 | Performance | 25 W | +3 (28 W) | +10 (35 W) |
 | Max | 35 W | +2 (37 W) | +10 (45 W) |
 
+**Legion Go S**
+
+| Preset | SPL | SPPT | FPPT |
+|---|---|---|---|
+| Minimum | 5 W | +3 (8 W) | +5 (10 W) |
+| Silent | 8 W | +2 (10 W) | +7 (15 W) |
+| Balanced | 18 W | +2 (20 W) | +7 (25 W) |
+| Performance | 33 W | +0 (33 W) | +2 (35 W) |
+| Max | 40 W | +3 (43 W) | +13 (53 W) |
+
 ---
 
 ## Requirements
 
 | Requirement | Details |
 |---|---|
-| Device | Lenovo Legion Go 2 (Ryzen Z2 Extreme / Strix Point) |
+| Device | Lenovo Legion Go 2, or Legion Go S (Ryzen Z1 Extreme) |
 | Firmware interface | `lenovo-wmi-other` under `/sys/class/firmware-attributes/` |
 | Plugin loader | [Decky Loader](https://decky.xyz) |
 
-> The extended TDP range additionally needs `ryzenadj`, which the plugin downloads on first run. Everything else works through the firmware alone.
+> On the Legion Go 2 the extended TDP range additionally needs `ryzenadj`, which the plugin downloads on first run. Everything else works through the firmware alone.
+
+### Hardware
+
+The sliders stop where the firmware says they do. Those limits are read from the
+hardware at startup rather than assumed, so each machine gets its own:
+
+| | SPL | SPPT | FPPT | Extras |
+|---|---|---|---|---|
+| Legion Go 2 (Ryzen Z2 Extreme) | 5-35 W, then up to 50 W via `ryzenadj` | 5-37 W | 5-45 W | yes |
+| Legion Go S (Ryzen Z1 Extreme) | 5-40 W | 5-43 W | 5-53 W | no |
+
+Measured on both machines. The Go S reports the higher firmware ceilings of the
+two, which is not what the names suggest.
+
+On the Legion Go S everything goes through the firmware. The plugin downloads
+`ryzenadj` itself when it needs it, and there it does not need it - the firmware
+range is the range, so the binary is never fetched and the **Extras** section is
+not shown. Each machine gets a preset ladder spaced against its own ceilings, so
+**Max** asks for exactly what that firmware accepts - 35/37/45 W on the Go 2 and
+40/43/53 W on the Go S.
+
+One consequence worth knowing: the live cross-check that catches an override
+bypassing the firmware interface reads through `ryzenadj`, so it does not run
+here. Drift is still corrected, but only what the firmware attributes report.
+
+**Other Legion Go S variants, including the Ryzen Z2 Go, are untested.** They
+match the same firmware-only path, which is the conservative one: the firmware
+alone, with the limits read from that machine rather than assumed from the Z1
+Extreme. A variant with lower ceilings will have the presets clamped down
+to them, so the top of the ladder may not line up with the **Max** label.
 
 ---
 
@@ -123,8 +171,8 @@ cat /sys/class/platform-profile/platform-profile-*/profile
 If one of them still reads `custom`, the firmware is still holding the plugin's
 last TDP. Write `balanced` to it to hand control back.
 
-**Extras**
-Unlocks the Custom sliders up to 50 W, applied through `ryzenadj` instead of the firmware. This overrides the manufacturer's safety limits - use at your own risk.
+**Extras** (Legion Go 2 only)
+Unlocks the Custom sliders up to 50 W, applied through `ryzenadj` instead of the firmware. The section is not shown on firmware-only hardware. This overrides the manufacturer's safety limits - use at your own risk.
 
 One caveat on this path: SPPT and FPPT read back exactly, but SPL does not. On Strix
 Point the `STAPM LIMIT` register that `ryzenadj --info` reports follows the fast limit
@@ -142,7 +190,7 @@ TDP carries the burst limits with it and the ordering `SPL <= SPPT <= FPPT` alwa
 
 | Parameter | WMI attribute | ryzenadj flag | Description | Range |
 |---|---|---|---|---|
-| SPL | `ppt_pl1_spl` | `--stapm-limit` | Sustained Power Limit - thermal steady-state target | 5-35 W (50 W with Extras) |
+| SPL | `ppt_pl1_spl` | `--stapm-limit` | Sustained Power Limit - thermal steady-state target | Go 2: 5-35 W (50 W with Extras), Go S: 5-40 W |
 | SPPT | `ppt_pl2_sppt` | `--slow-limit` | Slow Package Power Tracking - sustained hard ceiling | +0 to +10 W above SPL |
 | FPPT | `ppt_pl3_fppt` | `--fast-limit` | Fast Package Power Tracking - burst ceiling | +0 to +15 W above SPL |
 
@@ -176,6 +224,9 @@ The Python backend runs an enforce loop every 5 seconds that:
 3. Restores global settings when a game exits
 4. Re-applies settings if the system has overridden them (drift correction), giving up
    after a few attempts on targets the hardware silently refuses
+5. Re-asserts the limits over the seconds following a charger transition. The firmware
+   applies a profile of its own when the charger goes in and it lands after ours, so a
+   single write at the moment the state changes is overwritten
 
 Settings and per-game profiles are persisted through Decky's `SettingsManager`, so they
 survive reinstalling the plugin.

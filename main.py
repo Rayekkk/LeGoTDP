@@ -47,10 +47,6 @@ updater = Updater(
     logger=decky.logger,
 )
 
-# Matches the Balanced preset in src/index.tsx, so a fresh install and the
-# preset the panel highlights agree with each other.
-DEFAULT_SETTINGS = {"spl": 15000, "sppt": 18000, "fppt": 25000, "enabled": True}
-
 # Reported by get_caps() when the firmware does not answer. The frontend carries
 # the same numbers as FALLBACK_STD for the moments before get_caps() returns.
 FALLBACK_STD_W = {"spl": 35, "sppt": 37, "fppt": 45}
@@ -176,6 +172,22 @@ def _presets() -> dict:
     return PRESETS_LEGION_GO_S if _wmi_only() else PRESETS_DEFAULT
 
 
+def _defaults() -> dict:
+    """Where a fresh install starts, in milliwatts.
+
+    Read from the ladder rather than written out again, because Balanced is not
+    the same everywhere - 15 / 18 / 25 W on a Go 2, 18 / 20 / 25 W on a Go S.
+    Hard-coding one of them meant a fresh install on the other machine opened on
+    numbers belonging to a different device, and disagreed with the preset the
+    panel was highlighting at the same moment.
+    """
+    balanced = _presets()["balanced"]
+    return {"spl":  balanced["spl"]  * 1000,
+            "sppt": balanced["sppt"] * 1000,
+            "fppt": balanced["fppt"] * 1000,
+            "enabled": True}
+
+
 def _ceilings_mw() -> tuple[int, int, int]:
     """(spl, sppt, fppt) ceilings in milliwatts.
 
@@ -257,13 +269,13 @@ def _pick_profile_values(p: dict, ac_online: bool) -> tuple[int, int, int]:
     if ac_online and p.get("ac_separate") and p.get("ac_spl") is not None:
         return (
             p["ac_spl"],
-            p.get("ac_sppt", p.get("sppt", DEFAULT_SETTINGS["sppt"])),
-            p.get("ac_fppt", p.get("fppt", DEFAULT_SETTINGS["fppt"])),
+            p.get("ac_sppt", p.get("sppt", _defaults()["sppt"])),
+            p.get("ac_fppt", p.get("fppt", _defaults()["fppt"])),
         )
     return (
-        p.get("spl",  DEFAULT_SETTINGS["spl"]),
-        p.get("sppt", DEFAULT_SETTINGS["sppt"]),
-        p.get("fppt", DEFAULT_SETTINGS["fppt"]),
+        p.get("spl",  _defaults()["spl"]),
+        p.get("sppt", _defaults()["sppt"]),
+        p.get("fppt", _defaults()["fppt"]),
     )
 
 
@@ -331,7 +343,7 @@ def _clamp_triplet(spl, sppt, fppt) -> tuple[int, int, int]:
     try:
         spl, sppt, fppt = int(spl), int(sppt), int(fppt)
     except (TypeError, ValueError):
-        return DEFAULT_SETTINGS["spl"], DEFAULT_SETTINGS["sppt"], DEFAULT_SETTINGS["fppt"]
+        return _defaults()["spl"], _defaults()["sppt"], _defaults()["fppt"]
     spl_max, sppt_max, fppt_max = _ceilings_mw()
     spl  = max(HARD_MIN_MW, min(spl,  spl_max))
     fppt = max(spl,         min(fppt, fppt_max))
@@ -340,11 +352,11 @@ def _clamp_triplet(spl, sppt, fppt) -> tuple[int, int, int]:
 
 
 def _load_settings() -> dict:
-    s = _read_key(SETTINGS_KEY_SETTINGS, DEFAULT_SETTINGS)
+    s = _read_key(SETTINGS_KEY_SETTINGS, _defaults())
     s["spl"], s["sppt"], s["fppt"] = _clamp_triplet(
-        s.get("spl",  DEFAULT_SETTINGS["spl"]),
-        s.get("sppt", DEFAULT_SETTINGS["sppt"]),
-        s.get("fppt", DEFAULT_SETTINGS["fppt"]),
+        s.get("spl",  _defaults()["spl"]),
+        s.get("sppt", _defaults()["sppt"]),
+        s.get("fppt", _defaults()["fppt"]),
     )
     if any(k in s for k in ("active_spl", "active_sppt", "active_fppt")):
         s["active_spl"], s["active_sppt"], s["active_fppt"] = _clamp_triplet(
@@ -954,9 +966,9 @@ def _scan_proc_for_appid() -> str:
 # ── TDP enforce ────────────────────────────────────────────────────────────────
 
 def _global_triplet(s: dict) -> tuple[int, int, int]:
-    return (s.get("spl",  DEFAULT_SETTINGS["spl"]),
-            s.get("sppt", DEFAULT_SETTINGS["sppt"]),
-            s.get("fppt", DEFAULT_SETTINGS["fppt"]))
+    return (s.get("spl",  _defaults()["spl"]),
+            s.get("sppt", _defaults()["sppt"]),
+            s.get("fppt", _defaults()["fppt"]))
 
 
 def _apply_and_record(spl: int, sppt: int, fppt: int, why: str) -> None:
@@ -986,9 +998,9 @@ def _reapply_current_target() -> bool:
         _ac_target = ()
         return True
     target = _ac_target or _clamp_triplet(
-        s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
-        s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
-        s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+        s.get("active_spl",  s.get("spl",  _defaults()["spl"])),
+        s.get("active_sppt", s.get("sppt", _defaults()["sppt"])),
+        s.get("active_fppt", s.get("fppt", _defaults()["fppt"])),
     )
     if _ppt_matches(*(v // 1000 for v in target)):
         _ac_target = ()
@@ -1051,9 +1063,9 @@ def _check_and_enforce() -> dict:
         return events
 
     _enforce_target(_clamp_triplet(
-        s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
-        s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
-        s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+        s.get("active_spl",  s.get("spl",  _defaults()["spl"])),
+        s.get("active_sppt", s.get("sppt", _defaults()["sppt"])),
+        s.get("active_fppt", s.get("fppt", _defaults()["fppt"])),
     ))
     return events
 
@@ -1182,9 +1194,9 @@ class Plugin:
             p = _load_profiles().get(app_id)
             if p is None:
                 return {"exists": False, "profile": {}, "ac_separate": False, "ac_profile": {}}
-            spl  = p.get("spl",  DEFAULT_SETTINGS["spl"])
-            sppt = p.get("sppt", DEFAULT_SETTINGS["sppt"])
-            fppt = p.get("fppt", DEFAULT_SETTINGS["fppt"])
+            spl  = p.get("spl",  _defaults()["spl"])
+            sppt = p.get("sppt", _defaults()["sppt"])
+            fppt = p.get("fppt", _defaults()["fppt"])
             return {
                 "exists":      True,
                 "profile":     {"spl": spl, "sppt": sppt, "fppt": fppt,
@@ -1312,9 +1324,9 @@ class Plugin:
             # Whatever was cached describes the pre-suspend hardware.
             _invalidate_limits_cache()
             result = _apply_limits(*_clamp_triplet(
-                s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
-                s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
-                s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+                s.get("active_spl",  s.get("spl",  _defaults()["spl"])),
+                s.get("active_sppt", s.get("sppt", _defaults()["sppt"])),
+                s.get("active_fppt", s.get("fppt", _defaults()["fppt"])),
             ))
             decky.logger.info(
                 f"[legotdp] reapply after resume: success={result['success']}")
@@ -1351,8 +1363,8 @@ class Plugin:
                         and existing.get("ac_spl") is not None):
                     want = (
                         existing["ac_spl"],
-                        existing.get("ac_sppt", existing.get("sppt", DEFAULT_SETTINGS["sppt"])),
-                        existing.get("ac_fppt", existing.get("fppt", DEFAULT_SETTINGS["fppt"])),
+                        existing.get("ac_sppt", existing.get("sppt", _defaults()["sppt"])),
+                        existing.get("ac_fppt", existing.get("fppt", _defaults()["fppt"])),
                     )
 
             result = _apply_limits(*want)
@@ -1502,9 +1514,9 @@ class Plugin:
                 s = _load_settings()
                 if s.get("enabled", True):
                     _apply_limits(
-                        s.get("active_spl",  s.get("spl",  DEFAULT_SETTINGS["spl"])),
-                        s.get("active_sppt", s.get("sppt", DEFAULT_SETTINGS["sppt"])),
-                        s.get("active_fppt", s.get("fppt", DEFAULT_SETTINGS["fppt"])),
+                        s.get("active_spl",  s.get("spl",  _defaults()["spl"])),
+                        s.get("active_sppt", s.get("sppt", _defaults()["sppt"])),
+                        s.get("active_fppt", s.get("fppt", _defaults()["fppt"])),
                     )
             await _offload(_apply_saved)
         except Exception as e:

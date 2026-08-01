@@ -43,9 +43,9 @@ class ClampTriplet(unittest.TestCase):
         self.assertEqual(main._clamp_triplet(99000, 99000, 99000), (hi, hi, hi))
 
     def test_junk_falls_back_to_defaults(self):
-        defaults = (main.DEFAULT_SETTINGS["spl"],
-                    main.DEFAULT_SETTINGS["sppt"],
-                    main.DEFAULT_SETTINGS["fppt"])
+        defaults = (main._defaults()["spl"],
+                    main._defaults()["sppt"],
+                    main._defaults()["fppt"])
         self.assertEqual(main._clamp_triplet("nonsense", None, {}), defaults)
 
     def test_numeric_strings_are_accepted(self):
@@ -74,9 +74,9 @@ class ProfileSelection(unittest.TestCase):
     def test_missing_fields_fall_back_to_defaults(self):
         self.assertEqual(
             main._pick_profile_values({}, ac_online=False),
-            (main.DEFAULT_SETTINGS["spl"],
-             main.DEFAULT_SETTINGS["sppt"],
-             main.DEFAULT_SETTINGS["fppt"]),
+            (main._defaults()["spl"],
+             main._defaults()["sppt"],
+             main._defaults()["fppt"]),
         )
 
 
@@ -108,7 +108,7 @@ class Persistence(unittest.TestCase):
     def test_a_missing_store_yields_defaults(self):
         seed({})
         s = main._load_settings()
-        self.assertEqual(s["spl"], main.DEFAULT_SETTINGS["spl"])
+        self.assertEqual(s["spl"], main._defaults()["spl"])
         self.assertEqual(main._load_profiles(), {})
 
     def test_an_unsaved_edit_never_reaches_the_disk(self):
@@ -202,7 +202,7 @@ class Migration(unittest.TestCase):
     def test_missing_legacy_files_are_not_an_error(self):
         seed({})
         main._migrate()
-        self.assertEqual(main._load_settings()["spl"], main.DEFAULT_SETTINGS["spl"])
+        self.assertEqual(main._load_settings()["spl"], main._defaults()["spl"])
         self.assertGreaterEqual(
             int(main.settings.getSetting(main.SETTINGS_KEY_SCHEMA, 1)),
             main.CURRENT_SCHEMA,
@@ -920,6 +920,32 @@ class FirmwareOnlyHardware(unittest.TestCase):
         first = len(calls)
         main._wmi_only()
         self.assertEqual(len(calls), first)
+
+    def test_a_fresh_install_starts_on_this_machines_balanced(self):
+        """The bug this replaced: Balanced was written out once, in Go 2 watts,
+        so a first run on a Go S opened on 15/18/25 while the panel highlighted
+        a Balanced preset that meant 18/20/25."""
+        for dmi, expected in ((self.GO_S, self.GO_S_CAPS and main.PRESETS_LEGION_GO_S),
+                              (self.GO_2, main.PRESETS_DEFAULT),
+                              (self.UNKNOWN, main.PRESETS_DEFAULT)):
+            with self.subTest(family=dmi["product_family"] or "unknown"):
+                self._as(dmi)
+                balanced = expected["balanced"]
+                self.assertEqual(
+                    (main._defaults()["spl"], main._defaults()["sppt"], main._defaults()["fppt"]),
+                    (balanced["spl"] * 1000, balanced["sppt"] * 1000, balanced["fppt"] * 1000))
+
+    def test_the_two_machines_do_not_start_in_the_same_place(self):
+        """Guards the regression directly: if these ever agree again, the
+        per-device lookup has been flattened back to one hard-coded triplet."""
+        self._as(self.GO_S)
+        go_s = dict(main._defaults())
+        self._as(self.GO_2)
+        self.assertNotEqual(go_s, main._defaults())
+
+    def test_a_fresh_install_is_enabled(self):
+        self._as(self.GO_2)
+        self.assertTrue(main._defaults()["enabled"])
 
 
 class ChargerTransition(unittest.TestCase):

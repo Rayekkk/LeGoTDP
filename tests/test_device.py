@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Rayekkk
+# https://github.com/Rayekkk/LeGoTDP
+
 """Tests that need a real Legion Go 2 with the Lenovo WMI attributes present.
 
 They skip themselves when the firmware interface is absent, so the same

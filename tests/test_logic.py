@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Rayekkk
+# https://github.com/Rayekkk/LeGoTDP
+
 """Backend tests that need no Legion Go attached. These run in CI."""
 import asyncio
 import glob

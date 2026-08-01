@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Rayekkk
+// https://github.com/Rayekkk/LeGoTDP
+
 import {
   addEventListener,
   callable,

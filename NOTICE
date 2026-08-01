@@ -1,7 +1,7 @@
 LeGoTDP
 Copyright (c) 2026 Rayekkk
 
-This product is licensed under the MIT License. See LICENSE for the full text.
+This product is licensed under the BSD 3-Clause License. See LICENSE for the full text.
 
 ================================================================================
 Third-party components used by this plugin
@@ -23,7 +23,7 @@ inside the plugin directory. Anyone who prefers to supply their own build can
 drop it there before the plugin first starts and nothing will be fetched.
 
 The plugin invokes RyzenAdj as a separate process and does not link against
-it, so the plugin's own source remains under the MIT License. Anyone
+it, so the plugin's own source remains under the BSD 3-Clause License. Anyone
 redistributing this plugin must keep this notice intact.
 
 RyzenAdj is only needed for the extended TDP range in the Extras section. The

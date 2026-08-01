@@ -2,7 +2,7 @@
   "name": "legotdp",
   "version": "1.6.0",
   "description": "DeckyLoader plugin for setting TDP limits via ryzenadj",
-  "license": "MIT",
+  "license": "BSD-3-Clause",
   "type": "module",
   "scripts": {
     "build": "rollup -c",

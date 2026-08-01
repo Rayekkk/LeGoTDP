@@ -320,7 +320,7 @@ CI builds every push and pull request. Pushing a tag such as `1.5.0` builds the 
 
 ## License
 
-MIT - see [LICENSE](LICENSE). Third-party components are listed in [NOTICE](NOTICE).
+BSD 3-Clause - see [LICENSE](LICENSE). Third-party components are listed in [NOTICE](NOTICE).
 
 ---
 

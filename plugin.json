@@ -14,7 +14,7 @@
       "hardware",
       "performance"
     ],
-    "description": "Set AMD CPU TDP limits directly from the Steam overlay on the Lenovo Legion Go 2 and Legion Go S. Preset ladders spaced against each machine's own firmware ceilings, custom sliders, per-game profiles with separate battery and charging limits, and live power draw read from RAPL.",
-    "image": ""
+    "description": "AMD CPU TDP limits from the Steam overlay. Per-machine presets, per-game profiles, live power draw.",
+    "image": "https://raw.githubusercontent.com/Rayekkk/LeGoTDP/main/docs/logo.png"
   }
 }
